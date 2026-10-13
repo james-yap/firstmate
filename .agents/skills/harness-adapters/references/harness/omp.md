@@ -44,6 +44,7 @@ The captain's own `~/.omp/agent/config.yml` is never written; the tracked `.omp/
 omp auto-discovers `<cwd>/.omp/extensions/*.ts` (top level only, cwd only, no ancestor walk, no trust dialog) and the active profile's `agent/extensions/`; `.pi/extensions/` is not a discovery root.
 A file that is both auto-discovered and named with `-e` loads twice, so the per-task busy extension lives in `state/` and is the only `-e` a secondmate launch names.
 The primary extensions stay auto-discovered and are not named again.
+The primary-only identity boundary is owned by `.omp/extensions/fm-primary-omp-watch.ts`: omp rebinds factories to in-process subagents, but shared process ancestry does not confer supervision ownership.
 There is no `agent_settled` event; `agent_end` plus `willContinue` replaces it.
 
 ## Primary integration
@@ -53,5 +54,5 @@ The same file ports the `tool_call` seatbelts and delivers the session-start dig
 omp has no asynchronous Stop-hook equivalent, so the Claude auto-arm model does not apply; `fm_supervision_model` classifies omp as `extension`, and `fm_omp_extension_owns_supervision` in `../../../bin/fm-wake-lib.sh` is the ownership proof that tolerates the extension's own watcher hand-off.
 The Pi supervision branch does not run on omp; without the supervision host every actionable wake is delivered to main, and in a home with `config/supervision-host` and no `config/supervision-host-off` the watch extension spawns the host instead of the arm, with Claude's print mode as its headless engine ([`supervision-host.md`](../../../../../docs/supervision-host.md)).
 Launch a primary with plain `omp` inside the home (`FM_OMP_HARNESS=omp omp` when starting from a Claude pane); `../../../bin/fm-session-start.sh` prints `OMP_WATCH_EXTENSION: not loaded` when the running session has not loaded both tracked extensions.
-`FM_OMP_LIVE_E2E=1 ../../../tests/fm-omp-primary-live-e2e.test.sh` is the opt-in live guard; `../../../tests/fm-omp-harness.test.sh` is the portable regression.
+`FM_OMP_LIVE_E2E=1 ../../../tests/fm-omp-primary-live-e2e.test.sh` is the credentialed primary live guard; `../../../tests/fm-omp-subagent-live-e2e.test.sh` is the token-free live subagent-isolation guard, and `../../../tests/fm-omp-harness.test.sh` is the portable regression.
 A secondmate registered with `remote=1` in `data/secondmates.md`, spawned through the ordinary `../../../bin/fm-spawn.sh <id> <home> --secondmate` path, is refused on omp until a remote host verifies it, as is `../../../bin/fm-remote-secondmate-control.sh launch`; there is no `--remote` flag.

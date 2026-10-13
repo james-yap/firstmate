@@ -2536,6 +2536,13 @@ A throwaway scout was spawned through `bin/fm-spawn.sh --scout --harness omp --m
 
 `FM_OMP_LIVE_E2E=1 tests/fm-omp-primary-live-e2e.test.sh` refreshes the primary evidence; the worker path above is refreshed by repeating the scout dispatch after any omp upgrade.
 
+### In-process subagent boundary
+
+Verified on 2026-10-13 against omp 18.10.3.
+`bash tests/fm-omp-subagent-live-e2e.test.sh` refreshes the token-free proof that a real task child receives no supervision tool, digest, or wake, and that disposing that child leaves the primary able to receive the next wake.
+Observed result: `ok - omp/18.10.3: real task child has no supervision tool/digest/wake; primary receives a successor wake after child disposal`.
+`tests/fm-omp-harness.test.sh` pins the same boundary without a live omp, including primary repair and replacement handoff after child disposal.
+
 ## Busy inbox escalation
 
 Verified at `2026-10-03T19:20:07Z` on commit `23b0232908a5adc7fbf7339ef48c34a091a7a799` with Claude Code `2.1.288 (Claude Code)` on Herdr `0.9.1`, protocol `22`, in a named isolated lab session through `bin/fm-herdr-lab.sh`.

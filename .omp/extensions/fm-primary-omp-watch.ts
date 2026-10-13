@@ -46,6 +46,9 @@
 // handoff carries actionable closes that were still pending delivery; its
 // durable state lives at state/extensions/omp-primary-watch/session-replacement-actionable.json.
 // Stale callbacks from a prior generation are no-ops against the active replacement.
+// omp rebinds factories to task/eval/clone sessions in this same process, sharing
+// module globals and lock ancestry. Only ctx.agent.kind === "main" may activate
+// a generation or register supervision tools; depth, cwd and PID are not roles.
 //
 // Delivery versus consumption (stated once here):
 // A main follow-up is delivered once omp accepts it (sendUserMessage returns).
@@ -79,6 +82,8 @@ type ExtensionAPI = {
   registerCommand?: (name: string, command: { description: string; handler: (args: string, ctx: any) => Promise<void> | void }) => void;
   registerTool?: (tool: Record<string, unknown>) => void;
 };
+
+type AgentContext = { agent?: { kind: "main" | "sub" } };
 
 type ArmResult = {
   ok: boolean;
@@ -557,8 +562,8 @@ const cleanupOnProcessExit = () => {
 process.once("exit", cleanupOnProcessExit);
 
 export default function (pi: ExtensionAPI) {
-  let generation = createGeneration();
-  activateGeneration(generation);
+  let generation: SessionGeneration | null = null;
+  let controlsRegistered = false;
 
   async function sendWake(
     owner: SessionGeneration,
@@ -833,7 +838,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   const receiveReplacementActionable: ReplacementActionableReceiver = (pending) => {
-    if (!generationIsLive(generation)) return;
+    if (!generation || !generationIsLive(generation)) return;
     enqueuePendingActionable(generation, pending);
     void processPendingActionables(generation);
   };
@@ -1098,23 +1103,28 @@ export default function (pi: ExtensionAPI) {
     return result;
   }
 
-  pi.on?.("before_agent_start", (event) => {
+  pi.on?.("before_agent_start", (event, ctx) => {
+    if (ctx?.agent?.kind !== "main" || !generation) return;
     consumeWake(generation, String((event as { prompt?: unknown })?.prompt ?? ""));
   });
-  pi.on?.("message_start", (event) => {
+  pi.on?.("message_start", (event, ctx) => {
+    if (ctx?.agent?.kind !== "main" || !generation) return;
     const message = (event as { message?: { role?: unknown; content?: unknown } })?.message;
     if (!message || message.role !== "user") return;
     consumeWake(generation, userMessageText(message.content));
   });
 
-  pi.on?.("session_start", async () => {
-    if (generation.stopping) generation = createGeneration();
+  pi.on?.("session_start", async (_event, ctx) => {
+    if (ctx?.agent?.kind !== "main") return;
+    if (!generation || generation.stopping) generation = createGeneration();
     activateGeneration(generation);
     markLoaded();
+    registerControls();
     if (lockOwnership() !== "owned") return;
     activateOwnedWatch(generation);
   });
-  pi.on?.("session_shutdown", async () => {
+  pi.on?.("session_shutdown", async (_event, ctx) => {
+    if (ctx?.agent?.kind !== "main" || !generation) return;
     // omp carries no shutdown reason (verified: `reason` is undefined), so the
     // replacement handoff is always persisted when anything is pending; a
     // terminal quit then merely replays an already-drained wake next start.
@@ -1122,31 +1132,40 @@ export default function (pi: ExtensionAPI) {
     await stopSessionGeneration(generation, true);
   });
 
-  pi.registerCommand?.("fm-watch-arm-omp", {
-    description: "Arm firstmate watcher supervision through the omp extension instead of foreground bash.",
-    handler: async (_args, ctx) => {
-      const result = activateOwnedWatch(generation);
-      ctx?.ui?.notify?.(result.message, result.ok ? "info" : "warning");
-    },
-  });
+  function armFromContext(ctx: AgentContext): ArmResult {
+    if (ctx?.agent?.kind !== "main" || !generation) {
+      return { ok: false, message: "watcher: not armed - Firstmate supervision is primary-session only" };
+    }
+    return activateOwnedWatch(generation);
+  }
 
-  pi.registerTool?.({
-    name: "fm_watch_arm_omp",
-    label: "Arm firstmate watcher",
-    description: "Start the first required omp watcher cycle, or repair one only after a notification says the cycle is missing, failed, or unhealthy. Do not call after ordinary work or ordinary notifications; the omp extension re-arms automatically. Never run bin/fm-watch-arm.sh through bash.",
-    promptSnippet: "Start the first required omp watcher cycle or repair a cycle reported missing, failed, or unhealthy; ordinary re-arming is automatic.",
-    promptGuidelines: [
-      "Call fm_watch_arm_omp only for the first required cycle or after a notification says the cycle is missing, failed, or unhealthy. Do not call it after ordinary work, turn completion, or ordinary signal, stale, check, or heartbeat handling because the omp extension owns re-arming. Never run bin/fm-watch-arm.sh through bash.",
-    ],
-    parameters: Type.Object({}),
-    execute: async () => {
-      const result = activateOwnedWatch(generation);
-      return {
-        content: [{ type: "text", text: result.message }],
-        details: result,
-      };
-    },
-  });
+  function registerControls(): void {
+    if (controlsRegistered) return;
+    controlsRegistered = true;
+    pi.registerCommand?.("fm-watch-arm-omp", {
+      description: "Arm firstmate watcher supervision through the omp extension instead of foreground bash.",
+      handler: async (_args, ctx) => {
+        const result = armFromContext(ctx);
+        ctx?.ui?.notify?.(result.message, result.ok ? "info" : "warning");
+      },
+    });
 
-  markLoaded();
+    pi.registerTool?.({
+      name: "fm_watch_arm_omp",
+      label: "Arm firstmate watcher",
+      description: "Start the first required omp watcher cycle, or repair one only after a notification says the cycle is missing, failed, or unhealthy. Do not call after ordinary work or ordinary notifications; the omp extension re-arms automatically. Never run bin/fm-watch-arm.sh through bash.",
+      promptSnippet: "Start the first required omp watcher cycle or repair a cycle reported missing, failed, or unhealthy; ordinary re-arming is automatic.",
+      promptGuidelines: [
+        "Call fm_watch_arm_omp only for the first required cycle or after a notification says the cycle is missing, failed, or unhealthy. Do not call it after ordinary work, turn completion, or ordinary signal, stale, check, or heartbeat handling because the omp extension owns re-arming. Never run bin/fm-watch-arm.sh through bash.",
+      ],
+      parameters: Type.Object({}),
+      execute: async (_toolCallId: string, _params: unknown, _signal: unknown, _onUpdate: unknown, ctx: AgentContext) => {
+        const result = armFromContext(ctx);
+        return {
+          content: [{ type: "text", text: result.message }],
+          details: result,
+        };
+      },
+    });
+  }
 }

@@ -488,7 +488,7 @@ for (const name of ["session_start", "before_agent_start", "session_compact", "s
   if (!handlers.has(name)) throw new Error(`${name} handler was not registered`);
 }
 if (handlers.has("agent_settled")) throw new Error("omp guard must not listen for agent_settled");
-const ctx = { sessionManager: { getSessionId: () => "s1" } };
+const ctx = { agent: { kind: "main" }, sessionManager: { getSessionId: () => "s1" } };
 handlers.get("session_start")({ type: "session_start" }, ctx);
 const first = await handlers.get("before_agent_start")({ type: "before_agent_start", prompt: "hi" }, ctx);
 if (!first?.message?.content?.includes("FIRSTMATE_OP: v1 session-start: OMP DIGEST source=startup")) throw new Error(`first start did not deliver a startup digest: ${JSON.stringify(first)}`);
@@ -497,20 +497,24 @@ if (first.message.display !== false || first.message.customType !== "firstmate-s
 handlers.get("session_start")({ type: "session_start" }, ctx);
 const second = await handlers.get("before_agent_start")({ type: "before_agent_start", prompt: "hi" }, ctx);
 if (!second?.message?.content?.includes("source=clear")) throw new Error(`in-process replacement did not map to clear: ${JSON.stringify(second)}`);
-const allowed = await handlers.get("tool_call")({ type: "tool_call", toolName: "bash", input: { command: "ls" } }, {});
+const allowed = await handlers.get("tool_call")({ type: "tool_call", toolName: "bash", input: { command: "ls" } }, ctx);
 if (allowed.block) throw new Error("an ordinary command was blocked");
-const blocked = await handlers.get("tool_call")({ type: "tool_call", toolName: "bash", input: { command: "bin/fm-watch-arm.sh &" } }, {});
+const blocked = await handlers.get("tool_call")({ type: "tool_call", toolName: "bash", input: { command: "bin/fm-watch-arm.sh &" } }, ctx);
 if (blocked.block !== true || !blocked.reason.includes("seatbelt")) throw new Error(`backgrounded arm was not blocked: ${JSON.stringify(blocked)}`);
-const r1 = await handlers.get("session_stop")({ type: "session_stop", stop_hook_active: false }, {});
+const subBlocked = await handlers.get("tool_call")({ type: "tool_call", toolName: "bash", input: { command: "bin/fm-watch-arm.sh &" } }, { agent: { kind: "sub" }, sessionManager: { getSessionId: () => "advisor" } });
+if (subBlocked.block !== true) throw new Error(`advisor/subagent backgrounded arm was not blocked: ${JSON.stringify(subBlocked)}`);
+const subStop = await handlers.get("session_stop")({ type: "session_stop", stop_hook_active: false }, { agent: { kind: "sub" } });
+if (subStop !== undefined) throw new Error(`a subagent stop must not compel supervision: ${JSON.stringify(subStop)}`);
+const r1 = await handlers.get("session_stop")({ type: "session_stop", stop_hook_active: false }, ctx);
 if (r1?.continue !== true) throw new Error(`guard exit 2 did not compel a continuation: ${JSON.stringify(r1)}`);
 if (!r1.additionalContext.startsWith("⁣FIRSTMATE_OP: v1 turn-end-guard: ")) throw new Error(`continuation context is not typed operational input: ${r1.additionalContext}`);
 if (!r1.additionalContext.includes("TURN WOULD END BLIND") || !r1.additionalContext.includes("repair with fm_watch_arm_omp")) throw new Error("continuation dropped the guard text");
-const r2 = await handlers.get("session_stop")({ type: "session_stop", stop_hook_active: true }, {});
+const r2 = await handlers.get("session_stop")({ type: "session_stop", stop_hook_active: true }, ctx);
 if (r2 !== undefined) throw new Error(`the flagged second stop must stand down, got ${JSON.stringify(r2)}`);
 const payloads = readFileSync(process.env.FM_GUARD_LOG, "utf8").trim().split("\n");
 if (payloads.join("|") !== '{"stop_hook_active":false}|{"stop_hook_active":true}') throw new Error(`guard payloads were ${payloads.join("|")}`);
 if (!existsSync(`${process.env.FM_HOME}/state/.omp-turnend-extension-loaded`)) throw new Error("loaded marker was not written");
-await handlers.get("session_shutdown")({}, {});
+await handlers.get("session_shutdown")({}, ctx);
 EOF
 )
   status=$?
@@ -553,22 +557,24 @@ const pi = {
 };
 const mod = await import(pathToFileURL(process.env.EXT).href);
 mod.default(pi);
+const ctx = { agent: { kind: "main" } };
+await handlers.get("session_start")({}, ctx);
 if (!tool || tool.name !== "fm_watch_arm_omp") throw new Error("fm_watch_arm_omp was not registered");
 if (!command) throw new Error("/fm-watch-arm-omp was not registered");
 if (tool.parameters?.type !== "object") throw new Error("tool parameters must be an empty object schema");
-const result = await tool.execute();
-if (!/^watcher: started omp extension arm child 1;/.test(result.content[0].text)) throw new Error(`unexpected arm result: ${result.content[0].text}`);
+const result = await tool.execute("arm", {}, undefined, undefined, ctx);
+if (!result.details.ok) throw new Error(`primary arm failed: ${JSON.stringify(result)}`);
 const marker = readFileSync(`${process.env.FM_HOME}/state/.omp-watch-extension-loaded`, "utf8").split("\n");
 if (marker[1] !== String(process.pid)) throw new Error("loaded marker must record the session pid");
-const again = await tool.execute();
-if (!/^watcher: unchanged - omp extension already owns an arm child/.test(again.content[0].text)) throw new Error(`redundant arm was not an ownership no-op: ${again.content[0].text}`);
+const again = await tool.execute("arm", {}, undefined, undefined, ctx);
+if (!again.details.ok) throw new Error(`primary repair failed: ${JSON.stringify(again)}`);
 await new Promise((r) => setTimeout(r, 2500));
 if (sent.length !== 1) throw new Error(`expected one follow-up wake, saw ${sent.length}: ${JSON.stringify(sent)}`);
 if (!sent[0].m.startsWith("⁣FIRSTMATE_OP: v1 watcher: FIRSTMATE WATCHER WAKE: signal: omp-e2e done")) throw new Error(`unexpected wake text: ${sent[0].m}`);
 if (sent[0].o?.deliverAs !== "followUp") throw new Error("wake must be delivered as a follow-up");
 // The wake is consumed when omp starts the next run with that exact prompt.
-await handlers.get("before_agent_start")({ type: "before_agent_start", prompt: sent[0].m }, {});
-await handlers.get("session_shutdown")({}, {});
+await handlers.get("before_agent_start")({ type: "before_agent_start", prompt: sent[0].m }, ctx);
+await handlers.get("session_shutdown")({}, ctx);
 if (existsSync(`${process.env.FM_HOME}/state/extensions/omp-primary-watch/session-replacement-actionable.json`)) throw new Error("a consumed wake must not ride the replacement handoff");
 process.exit(0);
 EOF
@@ -635,7 +641,9 @@ const pi = {
 };
 const mod = await import(pathToFileURL(process.env.EXT).href);
 mod.default(pi);
-await tool.execute();
+const ctx = { agent: { kind: "main" } };
+await handlers.get("session_start")({}, ctx);
+await tool.execute("arm", {}, undefined, undefined, ctx);
 for (let i = 0; i < 60 && sent.length < 1; i += 1) await new Promise((r) => setTimeout(r, 100));
 const rows = readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n");
 if (rows.some((row) => row.startsWith("plain-arm="))) throw new Error(`an opted-in home ran the plain arm: ${rows.join(" | ")}`);
@@ -658,8 +666,8 @@ const awayNote = sent[0].m.includes("not from the captain: it is not a return");
 if (process.env.RECORD_KIND === "quiet" ? awayNote : !awayNote) {
   throw new Error(`the away note must appear exactly under an away record (${process.env.RECORD_KIND}): ${sent[0].m}`);
 }
-await handlers.get("before_agent_start")({ type: "before_agent_start", prompt: sent[0].m }, {});
-await handlers.get("session_shutdown")({}, {});
+await handlers.get("before_agent_start")({ type: "before_agent_start", prompt: sent[0].m }, ctx);
+await handlers.get("session_shutdown")({}, ctx);
 process.exit(0);
 EOF
 )
@@ -707,13 +715,15 @@ const pi = {
 };
 const mod = await import(pathToFileURL(process.env.EXT).href);
 mod.default(pi);
-await tool.execute();
+const ctx = { agent: { kind: "main" } };
+await handlers.get("session_start")({}, ctx);
+await tool.execute("arm", {}, undefined, undefined, ctx);
 for (let i = 0; i < 60 && !existsSync(process.env.FM_ARM_LOG); i += 1) await new Promise((r) => setTimeout(r, 100));
 const rows = existsSync(process.env.FM_ARM_LOG) ? readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n") : [];
 if (rows.length === 0 || !rows.every((row) => row.startsWith("plain-arm="))) {
   throw new Error(`a home that does not run the host must spawn only the plain arm: ${rows.join(" | ")}`);
 }
-await handlers.get("session_shutdown")({}, {});
+await handlers.get("session_shutdown")({}, ctx);
 process.exit(0);
 EOF
 )
@@ -765,24 +775,26 @@ const pi = {
 };
 const mod = await import(pathToFileURL(process.env.EXT).href);
 mod.default(pi);
-await tool.execute();
+const ctx = { agent: { kind: "main" } };
+await handlers.get("session_start")({}, ctx);
+await tool.execute("arm", {}, undefined, undefined, ctx);
 for (let i = 0; i < 60 && sent.length < 1; i += 1) await new Promise((r) => setTimeout(r, 100));
 if (sent.length !== 1) throw new Error(`expected one boundary follow-up, saw ${sent.length}: ${JSON.stringify(sent)}`);
 const boundary = "supervision-host: outcome 1 for demo [captain]: fixture boundary";
 if (!sent[0].m.includes(boundary)) throw new Error(`the follow-up lacks the boundary line: ${sent[0].m}`);
 // The session is replaced before omp consumes the boundary follow-up.
-await handlers.get("session_shutdown")({}, {});
+await handlers.get("session_shutdown")({}, ctx);
 const stored = JSON.parse(readFileSync(handoff, "utf8"));
 if (stored.pending.length !== 1 || !stored.pending[0].message.includes(boundary)) {
   throw new Error(`the unconsumed boundary did not ride the handoff: ${JSON.stringify(stored)}`);
 }
-await handlers.get("session_start")({ type: "session_start" }, {});
+await handlers.get("session_start")({ type: "session_start" }, ctx);
 for (let i = 0; i < 60 && sent.length < 2; i += 1) await new Promise((r) => setTimeout(r, 100));
 const replays = sent.slice(1);
 if (replays.some((item) => item.m.includes("watcher: FAILED"))) throw new Error(`the successor failed to load the handoff: ${JSON.stringify(replays)}`);
 if (replays.length !== 1 || !replays[0].m.includes(boundary)) throw new Error(`the successor did not replay the boundary: ${JSON.stringify(replays)}`);
-await handlers.get("before_agent_start")({ type: "before_agent_start", prompt: replays[0].m }, {});
-await handlers.get("session_shutdown")({}, {});
+await handlers.get("before_agent_start")({ type: "before_agent_start", prompt: replays[0].m }, ctx);
+await handlers.get("session_shutdown")({}, ctx);
 if (existsSync(handoff)) throw new Error("a consumed replay must not ride the replacement handoff again");
 process.exit(0);
 EOF
@@ -844,14 +856,16 @@ const pi = {
 };
 const mod = await import(pathToFileURL(process.env.EXT).href);
 mod.default(pi);
-await tool.execute();
+const ctx = { agent: { kind: "main" } };
+await handlers.get("session_start")({}, ctx);
+await tool.execute("arm", {}, undefined, undefined, ctx);
 for (let i = 0; i < 80 && sent.length < 2; i += 1) await new Promise((r) => setTimeout(r, 100));
 const second = sent.filter((item) => item.m.includes("signal: omp-host second"));
 if (second.length !== 1) throw new Error(`expected one follow-up for the split close, saw ${second.length}: ${JSON.stringify(sent)}`);
 if (!second[0].m.includes("supervision-host: outcome 2 for demo [captain]: fixture split")) {
   throw new Error(`the split close was delivered without its outcome line: ${second[0].m}`);
 }
-await handlers.get("session_shutdown")({}, {});
+await handlers.get("session_shutdown")({}, ctx);
 process.exit(0);
 EOF
 )
@@ -861,6 +875,113 @@ EOF
   pass ".omp watch extension: a host close split across stream chunks reaches main as one whole follow-up"
 }
 
+test_subagent_bindings_cannot_take_primary_supervision() {
+  local repo home out status
+  repo="$TMP_ROOT/subagent/repo"; home="$TMP_ROOT/subagent/home"
+  install_omp_extension_fixture "$repo"
+  mkdir -p "$home/state"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = --handling-delivered ] && exit 0
+printf '%s\n' "$$" >> "$FM_HOME/arms"
+printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+while [ ! -f "$FM_HOME/fire" ]; do sleep 0.1; done
+rm "$FM_HOME/fire"
+printf 'signal: isolated subagent regression\n'
+SH
+  cat > "$repo/bin/fm-sessionstart-run.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_HOME/digests"
+printf 'PRIMARY DIGEST\n'
+SH
+  chmod +x "$repo/bin/"*.sh
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" EXT_DIR="$repo/.omp/extensions" node --input-type=module 2>&1 <<'JS'
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+const home = process.env.FM_HOME;
+const watch = (await import(pathToFileURL(`${process.env.EXT_DIR}/fm-primary-omp-watch.ts`).href)).default;
+const guard = (await import(pathToFileURL(`${process.env.EXT_DIR}/fm-primary-turnend-guard.ts`).href)).default;
+const pause = () => new Promise(r => setTimeout(r, 50));
+async function until(check, label) {
+  for (let i = 0; i < 120; i++) { if (check()) return; await pause(); }
+  throw new Error(`timed out: ${label}`);
+}
+function bind(kind, id, depth = 0) {
+  const handlers = new Map(), tools = [], commands = [], messages = [];
+  const ctx = { agent: { kind, id, name: kind === "main" ? "main" : "scout", depth },
+    sessionManager: { getSessionId: () => id } };
+  const api = {
+    on(event, handler) { const list = handlers.get(event) ?? []; list.push(handler); handlers.set(event, list); },
+    registerTool(tool) { tools.push(tool); },
+    registerCommand(name, command) { commands.push(command); },
+    sendMessage(message) { messages.push(message.content); },
+    sendUserMessage(message) { messages.push(message); },
+  };
+  watch(api); guard(api);
+  return { ctx, tools, commands, messages, async emit(type, data = {}, context = ctx) {
+    const results = [];
+    for (const h of handlers.get(type) ?? []) results.push(await h({ type, ...data }, context));
+    return results;
+  }};
+}
+async function assertInert(sub) {
+  await sub.emit("session_start");
+  assert.equal(sub.tools.length, 0, "subagent must not receive the arm tool");
+  assert.equal(sub.commands.length, 0, "subagent must not receive the arm command");
+  assert((await sub.emit("before_agent_start", { prompt: "research" })).every(r => r === undefined));
+  await sub.emit("session_compact");
+  await sub.emit("session_shutdown");
+  assert.deepEqual(sub.messages, []);
+}
+// Missing lock must not invite a child to run startup or publish primary markers.
+await assertInert(bind("sub", "early", 1));
+assert(!existsSync(`${home}/digests`));
+assert(!existsSync(`${home}/state/.omp-watch-extension-loaded`));
+assert(!existsSync(`${home}/state/.omp-turnend-extension-loaded`));
+writeFileSync(`${home}/state/.lock`, `${process.pid}\n`);
+const main = bind("main", "primary");
+await main.emit("session_start");
+const digest = await main.emit("before_agent_start", { prompt: "start" });
+assert(digest.some(r => r?.message?.content.includes("PRIMARY DIGEST")));
+await until(() => existsSync(`${home}/arms`), "primary arm");
+const firstArm = readFileSync(`${home}/arms`, "utf8");
+const digestRuns = readFileSync(`${home}/digests`, "utf8");
+// Shared module, process, cwd and lock: neither nested tasks nor depth-zero
+// subagents may activate/stop the primary generation or steal its receiver.
+await assertInert(bind("sub", "task-child", 1));
+await assertInert(bind("sub", "clone-child", 0));
+await assertInert(bind(undefined, "unknown"));
+assert.equal(readFileSync(`${home}/arms`, "utf8"), firstArm);
+assert.equal(readFileSync(`${home}/digests`, "utf8"), digestRuns);
+const repair = await main.tools[0].execute("repair", {}, undefined, undefined, main.ctx);
+assert.equal(repair.details.ok, true, "disposing children must not disable primary repair");
+writeFileSync(`${home}/fire`, "");
+await until(() => main.messages.length === 1, "primary wake after child disposal");
+assert(main.messages[0].includes("signal: isolated subagent regression"));
+// A child cannot consume a pending primary wake even through a parent-bound
+// callback (advisor contexts can run through the main runner).
+await main.emit("before_agent_start", { prompt: main.messages[0] }, { agent: { kind: "sub" } });
+await main.emit("session_shutdown");
+const handoff = `${home}/state/extensions/omp-primary-watch/session-replacement-actionable.json`;
+assert(existsSync(handoff), "unconsumed primary wake must survive replacement");
+await assertInert(bind("sub", "between-replacements", 1));
+assert(existsSync(handoff), "child must not consume the replacement handoff");
+await main.emit("session_start");
+await until(() => main.messages.length === 2, "replacement replay");
+assert.equal(main.messages[1], main.messages[0]);
+await main.emit("before_agent_start", { prompt: main.messages[1] });
+await main.emit("session_shutdown");
+assert(!existsSync(handoff), "consumed wake must not replay again");
+process.exit(0);
+JS
+)
+  status=$?
+  expect_code 0 "$status" "omp subagent isolation: $out"
+  pass ".omp subagents: no supervision delivery or tools; primary repair and replacement handoff survive child disposal"
+}
+
+test_subagent_bindings_cannot_take_primary_supervision
 test_detection_anchored_name_and_marker_precedence
 test_lock_identity_and_liveness_classification
 test_spawn_launch_line_and_worker_wiring
