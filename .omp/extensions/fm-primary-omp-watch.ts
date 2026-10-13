@@ -57,6 +57,26 @@
 // consumes at the user message_start carrying the exact wake text; either
 // event finishes the pending record, and a still-unconsumed record rides the
 // replacement handoff.
+//
+// Wake gating (stated once here; docs/watcher-continuity.md carries the summary):
+// omp delivers queued follow-ups one at a time, and one drain presents and
+// acknowledges every queued row, so a follow-up handed to omp behind a busy main
+// starts a turn whose drain finds nothing. A signal, stale, or heartbeat wake is
+// row-backed (bin/fm-watch.sh appends its row before it prints the line), so
+// each such record carries the queue's highest sequence at its close
+// (queueSeq). While main is mid-run, or an earlier wake is still queued in omp,
+// the wake is held in unconsumedWakes with no text handed over. A final
+// agent_end (willContinue not true, the same busy edge bin/fm-spawn.sh's
+// per-task busy extension uses) judges the held wakes: one with no queued row
+// at or below its queueSeq is retired, and the rest ride one follow-up whose
+// replayable record is the latest watermark. A wake is judged the same way just
+// before any send and when a replacement replays it. Unjudged and always
+// delivered: check lines, supervision-host lines, a failure appendix, a record
+// without a watermark, and any queue the extension cannot read. A wake handed
+// to omp ages out of the queue at the next final agent_end (runEpoch), because
+// omp either consumed it or never will. A run flag or queued wake outliving a
+// missed agent_end is cleared by the hold timer after three consecutive
+// ctx.isIdle() answers, so a held wake never waits on an event omp never raised.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
@@ -97,6 +117,11 @@ type PendingActionableClose = {
   token: string;
   message: string;
   predecessorArmPid: string;
+  // The durable wake queue's highest sequence when the close was observed.
+  // Every row a row-backed wake announces was appended before its reason line
+  // printed, so this bounds what the wake can still be waiting on. Absent on a
+  // record that predates it or whose message is not row-backed.
+  queueSeq?: number;
   delivered?: true;
 };
 
@@ -106,8 +131,14 @@ type ReplacementActionableHandoff = {
 };
 
 type UnconsumedWake = {
+  // The text omp was handed; empty while the wake is held.
   content: string;
   pending: PendingActionableClose;
+  // Set while main is busy: the wake is accepted into the pipeline but not yet
+  // handed to omp, so a drain that acknowledges its rows first retires it.
+  held?: string;
+  // The run epoch when the text was handed to omp.
+  epoch?: number;
 };
 
 type SessionGeneration = {
@@ -122,6 +153,16 @@ type SessionGeneration = {
   seq: number;
   pendingActionables: PendingActionableClose[];
   cleanupFailure: string;
+  // omp's session context from the latest event this generation saw: its idle
+  // answer is the authority on whether main is mid-run when a wake is ready.
+  ctx: { isIdle?: () => boolean } | null;
+  // A main run is under way, from the prompt that started it to agent_end.
+  agentRunning: boolean;
+  // Counts final agent_end events; ages a wake handed to omp out of the queue.
+  runEpoch: number;
+  // Rechecks held wakes while main is idle but agent_end has not flushed them.
+  holdTimer: ReturnType<typeof setInterval> | null;
+  idleChecks: number;
   // Main follow-ups omp has accepted but not yet consumed, by pending token.
   // Never cleared at shutdown: a delivery continuation that runs after the
   // replacement began reads it to tell a main-queued wake (replayed) from a
@@ -320,13 +361,61 @@ function nodeErrorCode(error: unknown): string {
     : "";
 }
 
+// A wake whose whole message is one signal, stale, or heartbeat reason line is
+// row-backed: bin/fm-watch.sh appends its durable queue row before it prints
+// the line, so a drain that has acknowledged every row up to the close has
+// already presented everything the wake announces. A check line can announce a
+// durable record outside the queue, a host line is the host's own handback, and
+// a failure appendix is new information; none of those is ever judged obsolete.
+function rowBackedMessage(message: string): boolean {
+  return /^(signal:|stale:|heartbeat($|:))[^\n]*$/.test(message);
+}
+
+// The queue's highest appended sequence. A queue that never appended a row has
+// no sequence file, and a wake printed without a row has nothing to be judged
+// against, so both read as undefined.
+function currentQueueSeq(): number | undefined {
+  try {
+    const text = readFileSync(`${state}/.wake-queue.seq`, "utf8").trim();
+    return /^[1-9][0-9]*$/.test(text) ? Number(text) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Whether main's drain already handled everything this wake can announce: no
+// queued row at or below the close's watermark remains. Rows past the watermark
+// belong to a later close, which carries its own wake, and the recovery marker
+// is deliberately not consulted because it is one slot every later append
+// reopens. Any doubt (unreadable or malformed queue, a record without a
+// watermark) answers false, so an unhandled event is always delivered.
+function wakeAlreadyHandled(pending: PendingActionableClose): boolean {
+  if (pending.queueSeq === undefined || !rowBackedMessage(pending.message)) return false;
+  let queue = "";
+  try {
+    queue = readFileSync(process.env.FM_WAKE_QUEUE || `${state}/.wake-queue`, "utf8");
+  } catch (error) {
+    return nodeErrorCode(error) === "ENOENT";
+  }
+  for (const line of queue.split("\n")) {
+    if (!line) continue;
+    const fields = line.split("\t");
+    if (fields.length < 5 || !/^[0-9]+$/.test(fields[1])) return false;
+    if (Number(fields[1]) <= pending.queueSeq) return false;
+  }
+  return true;
+}
+
 function createPendingActionable(message: string, predecessorArmPid: string): PendingActionableClose {
-  return {
+  const pending: PendingActionableClose = {
     version: 1,
     token: `${process.pid}-${Date.now()}-${++replacementCoordinator.nextTokenId}`,
     message,
     predecessorArmPid,
   };
+  const queueSeq = rowBackedMessage(message) ? currentQueueSeq() : undefined;
+  if (queueSeq !== undefined) pending.queueSeq = queueSeq;
+  return pending;
 }
 
 function validatePendingActionable(value: unknown): PendingActionableClose {
@@ -340,6 +429,8 @@ function validatePendingActionable(value: unknown): PendingActionableClose {
       !/^supervision-host:/m.test((value as { message: string }).message)) ||
     typeof (value as { predecessorArmPid?: unknown }).predecessorArmPid !== "string" ||
     !/^[0-9]*$/.test((value as { predecessorArmPid: string }).predecessorArmPid) ||
+    ((value as { queueSeq?: unknown }).queueSeq !== undefined &&
+      !Number.isSafeInteger((value as { queueSeq?: unknown }).queueSeq)) ||
     ((value as { delivered?: unknown }).delivered !== undefined &&
       (value as { delivered?: unknown }).delivered !== true)
   ) {
@@ -485,6 +576,11 @@ function createGeneration(): SessionGeneration {
     seq: 0,
     pendingActionables: [],
     cleanupFailure: "",
+    ctx: null,
+    agentRunning: false,
+    runEpoch: 0,
+    holdTimer: null,
+    idleChecks: 0,
     unconsumedWakes: new Map(),
     deferredClose: null,
   };
@@ -502,8 +598,10 @@ function stopGeneration(generation: SessionGeneration): ChildProcess | null {
   generation.stopping = true;
   if (generation.retryTimer) clearTimeout(generation.retryTimer);
   if (generation.cleanupTimer) clearTimeout(generation.cleanupTimer);
+  clearInterval(generation.holdTimer ?? undefined);
   generation.retryTimer = null;
   generation.cleanupTimer = null;
+  generation.holdTimer = null;
   const child = generation.child;
   if (child) child.kill("SIGTERM");
   generation.child = null;
@@ -560,17 +658,130 @@ export default function (pi: ExtensionAPI) {
   let generation = createGeneration();
   activateGeneration(generation);
 
+  function wakeContent(message: string): string {
+    return encodeFirstmateOperationalInput(
+      "watcher",
+      `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first and handle the queued wake. Watcher continuity is extension-owned.`,
+    );
+  }
+
+  // Main cannot act on a new wake until its current run and any wake already
+  // handed to omp are done; a wake handed over now would only queue behind them.
+  // The run flag follows the same agent_start / agent_end (without willContinue)
+  // edges as the per-task busy extension: ctx.isIdle() still reads false at a
+  // natural agent_end, so it is only trusted for the idle answer in the hold
+  // timer's stuck-flag recovery. A wake handed over before the last final
+  // agent_end is no longer queued behind anything: omp either consumed it or
+  // never will (a batched prompt never matches its text), and it must not
+  // hold later wakes back.
+  function mainIsBusy(owner: SessionGeneration): boolean {
+    for (const wake of owner.unconsumedWakes.values()) {
+      if (wake.held === undefined && wake.epoch === owner.runEpoch) return true;
+    }
+    return owner.agentRunning;
+  }
+
+  function retireHeldWake(owner: SessionGeneration, token: string, wake: UnconsumedWake): void {
+    owner.unconsumedWakes.delete(token);
+    wake.pending.delivered = true;
+    try {
+      finishPendingActionable(owner, wake.pending);
+    } catch (error) {
+      surfaceCleanupFailure(owner, error);
+      schedulePendingCleanup(owner);
+    }
+  }
+
+  // Hand omp the wakes held while main was busy, once main is idle. A wake whose
+  // rows main's own drain already acknowledged is retired without a turn; the
+  // rest ride one follow-up, and the latest watermark's record is the one a
+  // replacement replays because its drain covers every earlier held row.
+  async function flushHeldWakes(owner: SessionGeneration): Promise<void> {
+    if (!generationIsLive(owner)) return;
+    const held = [...owner.unconsumedWakes].filter(([, wake]) => wake.held !== undefined);
+    if (held.length === 0) {
+      clearInterval(owner.holdTimer ?? undefined);
+      owner.holdTimer = null;
+      return;
+    }
+    if (mainIsBusy(owner)) return;
+    clearInterval(owner.holdTimer ?? undefined);
+    owner.holdTimer = null;
+    const live: [string, UnconsumedWake][] = [];
+    for (const entry of held) {
+      if (wakeAlreadyHandled(entry[1].pending)) {
+        retireHeldWake(owner, entry[0], entry[1]);
+      } else {
+        live.push(entry);
+      }
+    }
+    if (live.length === 0) return;
+    live.sort((a, b) => (a[1].pending.queueSeq ?? 0) - (b[1].pending.queueSeq ?? 0));
+    const [primaryToken, primary] = live[live.length - 1];
+    const reasons = [...new Set(live.map(([, wake]) => wake.held as string))];
+    for (const [token, wake] of live) {
+      if (token !== primaryToken) retireHeldWake(owner, token, wake);
+    }
+    const content = wakeContent(reasons.join("\n"));
+    primary.content = content;
+    primary.epoch = owner.runEpoch;
+    delete primary.held;
+    try {
+      await pi.sendUserMessage(content, { deliverAs: "followUp" });
+    } catch (error) {
+      owner.unconsumedWakes.delete(primaryToken);
+      surfaceFailure(owner, `watcher: FAILED - omp extension could not deliver an actionable wake\n${error instanceof Error ? error.message : String(error)}`);
+      void processPendingActionables(owner);
+    }
+  }
+
+  function armHoldTimer(owner: SessionGeneration): void {
+    if (owner.holdTimer) return;
+    const timer = setInterval(() => {
+      if (!generationIsLive(owner)) return;
+      if (mainIsBusy(owner)) {
+        // A run flag or queued wake that outlives an idle session (agent_end
+        // never arrived) must not hold a wake forever: three consecutive idle
+        // answers end the run as a final agent_end would.
+        let idle = false;
+        try {
+          idle = owner.ctx?.isIdle?.() === true;
+        } catch {
+          idle = false;
+        }
+        owner.idleChecks = idle ? owner.idleChecks + 1 : 0;
+        if (owner.idleChecks >= 3) {
+          owner.agentRunning = false;
+          owner.runEpoch += 1;
+          owner.idleChecks = 0;
+        }
+      }
+      void flushHeldWakes(owner);
+    }, 1000);
+    timer.unref();
+    owner.holdTimer = timer;
+  }
+
   async function sendWake(
     owner: SessionGeneration,
     message: string,
     pending?: PendingActionableClose,
   ): Promise<boolean> {
     if (!generationIsLive(owner)) return false;
-    const content = encodeFirstmateOperationalInput(
-      "watcher",
-      `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first and handle the queued wake. Watcher continuity is extension-owned.`,
-    );
-    if (pending) owner.unconsumedWakes.set(pending.token, { content, pending });
+    // Only the original reason line is judged: a wake that gained a failure
+    // appendix carries new information and is always delivered.
+    if (pending && message === pending.message) {
+      // Main's drain already acknowledged what this wake announces; handing it
+      // to omp would only start a turn whose drain finds nothing.
+      if (wakeAlreadyHandled(pending)) return true;
+      if (pending.queueSeq !== undefined && mainIsBusy(owner)) {
+        owner.unconsumedWakes.set(pending.token, { content: "", pending, held: message });
+        armHoldTimer(owner);
+        return true;
+      }
+    }
+    const content = wakeContent(message);
+    if (pending) owner.unconsumedWakes.set(pending.token, { content, pending, epoch: owner.runEpoch });
     try {
       await pi.sendUserMessage(content, { deliverAs: "followUp" });
     } catch (error) {
@@ -588,7 +799,7 @@ export default function (pi: ExtensionAPI) {
   // streaming main at the user message_start that joins the running run.
   function consumeWake(owner: SessionGeneration, text: string): void {
     for (const [token, wake] of owner.unconsumedWakes) {
-      if (wake.content !== text) continue;
+      if (wake.held !== undefined || wake.content !== text) continue;
       owner.unconsumedWakes.delete(token);
       wake.pending.delivered = true;
       try {
@@ -1098,8 +1309,26 @@ export default function (pi: ExtensionAPI) {
     return result;
   }
 
-  pi.on?.("before_agent_start", (event) => {
+  pi.on?.("before_agent_start", (event, ctx) => {
+    generation.ctx = ctx;
+    generation.agentRunning = true;
     consumeWake(generation, String((event as { prompt?: unknown })?.prompt ?? ""));
+  });
+  pi.on?.("agent_start", (_event, ctx) => {
+    generation.ctx = ctx;
+    generation.agentRunning = true;
+  });
+  // The run is over: wakes held behind it are judged against what its drain
+  // acknowledged, and only the still-unhandled ones reach omp.
+  pi.on?.("agent_end", (event, ctx) => {
+    generation.ctx = ctx;
+    // A continuation (retry, compaction, queued follow-up, forced stop
+    // continuation) is coming: main is still busy.
+    if ((event as { willContinue?: unknown })?.willContinue === true) return;
+    generation.agentRunning = false;
+    generation.runEpoch += 1;
+    generation.idleChecks = 0;
+    void flushHeldWakes(generation);
   });
   pi.on?.("message_start", (event) => {
     const message = (event as { message?: { role?: unknown; content?: unknown } })?.message;
@@ -1107,9 +1336,10 @@ export default function (pi: ExtensionAPI) {
     consumeWake(generation, userMessageText(message.content));
   });
 
-  pi.on?.("session_start", async () => {
+  pi.on?.("session_start", async (_event, ctx) => {
     if (generation.stopping) generation = createGeneration();
     activateGeneration(generation);
+    generation.ctx = ctx;
     markLoaded();
     if (lockOwnership() !== "owned") return;
     activateOwnedWatch(generation);

@@ -861,6 +861,199 @@ EOF
   pass ".omp watch extension: a host close split across stream chunks reaches main as one whole follow-up"
 }
 
+# A busy main hands omp one follow-up per close, and omp delivers them one at a
+# time. The production drain presents and acknowledges every queued row in a
+# single turn, so each follow-up queued behind it started a turn whose drain
+# found nothing. This drives a real watcher-shaped arm (production queue
+# appends), the production drain and acknowledgement, and the extension over a
+# fake omp API, and asserts a wake reaches omp only while something it
+# announces is still unacknowledged.
+test_watch_extension_skips_wakes_main_already_drained() {
+  local repo home out status
+  repo="$TMP_ROOT/watch-drained/repo"; home="$TMP_ROOT/watch-drained/home"
+  install_omp_extension_fixture "$repo"
+  mkdir -p "$home/state" "$TMP_ROOT/watch-drained/tangle"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = --handling-delivered ] && exit 0
+state=${FM_HOME:?}/state
+n=$(( $(cat "$state/.cycle" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$state/.cycle"
+printf 'watcher: started pid=%s (beacon fresh) recovery-generation=gen-%s\n' "$$" "$n"
+while [ ! -e "$state/.fire-$n" ]; do sleep 0.05; done
+key=$(cat "$state/.fire-$n")
+# Production order: the durable row is appended before the reason line prints.
+FM_STATE_OVERRIDE=$state bash -c '. "$1/bin/fm-wake-lib.sh"; fm_wake_append stale "$2" "stale: $2"' _ "${FM_TEST_ROOT:?}" "$key"
+printf 'stale: %s\n' "$key"
+exit 0
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_TEST_ROOT="$ROOT" FM_TANGLE_ROOT="$TMP_ROOT/watch-drained/tangle" \
+    FM_OMP_ARM_READY_TIMEOUT_MS=3000 FM_WATCH_REARM_RETRY_LIMIT=1 FM_WATCH_REARM_RETRY_BASE_MS=5 FM_WATCH_REARM_RETRY_MAX_MS=10 \
+    EXT="$repo/.omp/extensions/fm-primary-omp-watch.ts" node --input-type=module 2>&1 <<'EOF'
+import { pathToFileURL } from "node:url";
+import { writeFileSync, readFileSync, existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+const home = process.env.FM_HOME;
+const state = `${home}/state`;
+writeFileSync(`${state}/.lock`, `${process.pid}\n`);
+const handoff = `${state}/extensions/omp-primary-watch/session-replacement-actionable.json`;
+const handlers = new Map(); let tool = null; const sent = [];
+const pi = {
+  on(e, h) { handlers.set(e, h); },
+  registerCommand() {},
+  registerTool(t) { tool = t; },
+  sendUserMessage(m, o) { sent.push({ m, o }); return undefined; },
+};
+let idle = false;
+const ctx = { isIdle: () => idle };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const cycle = () => (existsSync(`${state}/.cycle`) ? Number(readFileSync(`${state}/.cycle`, "utf8").trim()) : 0);
+const assert = (ok, message) => { if (!ok) throw new Error(message); };
+// One watcher cycle ends with a reason for <key>; its successor must be up
+// before the wake is judged, exactly as the extension orders them.
+async function fire(key) {
+  for (let i = 0; i < 100 && cycle() === 0; i += 1) await sleep(50);
+  const c = cycle();
+  assert(c > 0, "the watcher cycle never started");
+  writeFileSync(`${state}/.fire-${c}`, key);
+  for (let i = 0; i < 100 && cycle() === c; i += 1) await sleep(50);
+  assert(cycle() > c, `no successor cycle started after ${key}`);
+  await sleep(250);
+}
+// The production drain, as main runs it; ack=false is a turn that presented the
+// rows and ended before acknowledging them. Its acknowledgement command is
+// printed on stderr, so both streams are read.
+function runDrain(args) {
+  const result = spawnSync("bash", [`${process.env.FM_TEST_ROOT}/bin/fm-wake-drain.sh`, ...args], {
+    encoding: "utf8",
+    env: { ...process.env, FM_STATE_OVERRIDE: state, FM_ROOT_OVERRIDE: process.env.FM_TANGLE_ROOT },
+  });
+  assert(result.status === 0, `the drain failed: ${result.stdout}${result.stderr}`);
+  return `${result.stdout}\n${result.stderr}`;
+}
+function drain(ack) {
+  const out = runDrain([]);
+  const rows = out.split("\n").filter((l) => /^[0-9]+\t[0-9]+\tstale\t/.test(l)).map((l) => l.split("\t")[3]);
+  const cmd = out.match(/^WAKE_ACK_REQUIRED: .*run bin\/fm-wake-drain\.sh (--ack-through [0-9]+ --recovery-generation \S+)$/m);
+  if (ack && cmd) runDrain(cmd[1].split(" "));
+  return { rows, needsAck: Boolean(cmd) };
+}
+// omp raises these events whether or not an extension listens for them.
+async function emit(name, event) {
+  const handler = handlers.get(name);
+  if (handler) await handler(event, ctx);
+}
+async function startRun(prompt) {
+  idle = false;
+  await emit("before_agent_start", { type: "before_agent_start", prompt });
+  await emit("agent_start", { type: "agent_start" });
+}
+async function endRun() {
+  idle = true;
+  await emit("agent_end", { type: "agent_end" });
+  await sleep(100);
+}
+const mod = await import(pathToFileURL(process.env.EXT).href);
+mod.default(pi);
+await handlers.get("session_start")({ type: "session_start" }, ctx);
+await sleep(300);
+
+// 1. A burst of closes lands while main is handling the first one. One drain
+//    acknowledges all three rows, so no further turn may be started.
+await fire("w1");
+assert(sent.length === 1 && sent[0].m.includes("stale: w1"), `the first close must reach omp at once: ${JSON.stringify(sent)}`);
+await startRun(sent[0].m);
+await fire("w2");
+await fire("w3");
+assert(sent.length === 1, `closes during a busy run must not queue extra follow-ups: ${sent.map((s) => s.m)}`);
+let first = drain(true);
+assert(first.rows.join() === "w1,w2,w3" && first.needsAck, `one drain must present the whole burst: ${JSON.stringify(first)}`);
+await endRun();
+assert(sent.length === 1, `wakes for acknowledged rows started another turn: ${sent.length - 1} redundant follow-up(s)`);
+assert(drain(true).rows.length === 0, "the rows of the burst were not all acknowledged");
+
+// 2. A close that arrives after the drain of main announces an unseen row: it is
+//    delivered when the run ends, alone, while the drained ones are not.
+await startRun("operator prompt");
+await fire("w4");
+await fire("w5");
+first = drain(true);
+assert(first.rows.join() === "w4,w5", `unexpected drain rows: ${JSON.stringify(first)}`);
+await fire("w6");
+await endRun();
+assert(sent.length === 2, `the genuinely new close must be delivered exactly once: ${sent.slice(1).map((s) => s.m)}`);
+assert(sent[1].m.includes("stale: w6") && !/stale: w[45]\b/.test(sent[1].m), `the new wake named drained rows: ${sent[1].m}`);
+await startRun(sent[1].m);
+const second = drain(true);
+assert(second.rows.join() === "w6", `the delivered wake must find exactly the new row: ${JSON.stringify(second)}`);
+await endRun();
+assert(sent.length === 2, "handling the new wake started another turn");
+
+// 3. Presented but never acknowledged rows stay owed: the wake is delivered.
+await startRun("operator prompt");
+await fire("w7");
+drain(false);
+await endRun();
+assert(sent.length === 3 && sent[2].m.includes("stale: w7"), `an unacknowledged row lost its wake: ${JSON.stringify(sent.slice(2))}`);
+await startRun(sent[2].m);
+assert(drain(true).rows.join() === "w7", "the unacknowledged row was not presented again");
+await endRun();
+
+// 4. A follow-up omp accepted but the session was replaced before consuming:
+//    the replay is silent once the rows were acknowledged meanwhile...
+await fire("w8");
+assert(sent.length === 4 && sent[3].m.includes("stale: w8"), `an idle main must receive the close at once: ${JSON.stringify(sent.slice(3))}`);
+await handlers.get("session_shutdown")({}, ctx);
+assert(existsSync(handoff), "the unconsumed wake did not ride the replacement handoff");
+assert(drain(true).rows.join() === "w8", "the rows of the replaced session were not presented");
+await handlers.get("session_start")({ type: "session_start" }, ctx);
+await sleep(600);
+assert(sent.length === 4, `a replay of an already-acknowledged wake started a turn: ${JSON.stringify(sent.slice(4))}`);
+assert(!existsSync(handoff), "the obsolete replay stayed in the replacement handoff");
+
+// 5. ...and still delivered when the rows are unacknowledged.
+await fire("w9");
+assert(sent.length === 5 && sent[4].m.includes("stale: w9"), `unexpected follow-ups: ${JSON.stringify(sent.slice(4))}`);
+await handlers.get("session_shutdown")({}, ctx);
+await handlers.get("session_start")({ type: "session_start" }, ctx);
+for (let i = 0; i < 60 && sent.length < 6; i += 1) await sleep(100);
+assert(sent.length === 6 && sent[5].m.includes("stale: w9"), `an owed wake was not replayed after replacement: ${JSON.stringify(sent.slice(5))}`);
+await startRun(sent[5].m);
+assert(drain(true).rows.join() === "w9", "the replayed wake found no row");
+await endRun();
+
+// 6. A wake omp never reports consuming (a batched prompt never matches its
+//    text) must not hold later wakes back once a run has ended.
+await fire("w10");
+assert(sent.length === 7 && sent[6].m.includes("stale: w10"), `an idle main must receive the close at once: ${JSON.stringify(sent.slice(6))}`);
+await startRun("operator prompt");
+assert(drain(true).rows.join() === "w10", "the unconsumed wake row was not presented");
+await endRun();
+await fire("w11");
+assert(sent.length === 8 && sent[7].m.includes("stale: w11"), `a wake omp never consumed held back the next one: ${JSON.stringify(sent.slice(7))}`);
+await startRun(sent[7].m);
+assert(drain(true).rows.join() === "w11", "the follow-up wake found no row");
+await endRun();
+
+// 7. A run flag that never clears (no agent_end) must not hold a wake forever
+//    once omp reports the session idle.
+await emit("agent_start", { type: "agent_start" });
+idle = true;
+await fire("w12");
+assert(sent.length === 8, "a wake was sent while the run flag was set");
+for (let i = 0; i < 80 && sent.length < 9; i += 1) await sleep(100);
+assert(sent.length === 9 && sent[8].m.includes("stale: w12"), `a held wake was lost behind a stuck run flag: ${JSON.stringify(sent.slice(8))}`);
+await handlers.get("session_shutdown")({}, ctx);
+process.exit(0);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "omp watch extension drained-wake gate: $out"
+  [ -z "$out" ] || fail "omp watch extension drained-wake gate test printed output: $out"
+  pass ".omp watch extension: a wake whose rows main already acknowledged starts no turn, while unhandled and new rows still do"
+}
+
 test_detection_anchored_name_and_marker_precedence
 test_lock_identity_and_liveness_classification
 test_spawn_launch_line_and_worker_wiring
@@ -877,3 +1070,4 @@ test_watch_extension_runs_the_supervision_host quiet
 test_watch_extension_keeps_the_arm_without_the_file_or_with_off
 test_watch_extension_replays_a_host_only_boundary_across_replacement
 test_watch_extension_delivers_a_split_host_close_whole
+test_watch_extension_skips_wakes_main_already_drained
