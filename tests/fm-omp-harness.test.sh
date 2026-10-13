@@ -30,6 +30,9 @@
 #      stands down when the payload already carries stop_hook_active.
 #   7. The watch extension arms through fm_watch_arm_omp and delivers an
 #      actionable close as one follow-up.
+#   8. A row-backed check wake is held while main is busy and retired once its
+#      rows are acknowledged, while a check handback with no queue row is
+#      always delivered.
 set -u
 
 # shellcheck source=tests/fixtures.sh
@@ -1067,6 +1070,177 @@ EOF
   [ -z "$out" ] || fail "omp watch extension drained-wake gate test printed output: $out"
   pass ".omp watch extension: a wake whose rows main already acknowledged starts no turn, while unhandled and new rows still do"
 }
+# Row-backed check wakes (registered check outputs, secondmate liveness and
+# wake-loop rows, rejected-authentication rows) must gate like signal, stale,
+# and heartbeat wakes: held while main is busy, then retired once the drain
+# acknowledges their rows. Check handbacks whose obligation lives outside the
+# queue (a merged outcome, rearm-resurface, inactive-outcome, contribution
+# output, a process-event surface) must still be delivered at once.
+test_watch_extension_retires_row_backed_check_wakes() {
+  local repo home out status
+  repo="$TMP_ROOT/watch-checks/repo"; home="$TMP_ROOT/watch-checks/home"
+  install_omp_extension_fixture "$repo"
+  mkdir -p "$home/state" "$TMP_ROOT/watch-checks/tangle"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = --handling-delivered ] && exit 0
+state=${FM_HOME:?}/state
+n=$(( $(cat "$state/.cycle" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$state/.cycle"
+printf 'watcher: started pid=%s (beacon fresh) recovery-generation=gen-%s\n' "$$" "$n"
+while [ ! -e "$state/.fire-$n" ]; do sleep 0.05; done
+key=$(cat "$state/.fire-$n")
+# Production order: a row-backed producer appends its durable check row before
+# the reason line prints. A NOROW: close prints a handback that owns no row,
+# exactly like the merged-outcome, rearm, inactive-outcome, contribution, and
+# process-event producers.
+case "$key" in
+  NOROW:*) printf '%s\n' "${key#NOROW:}" ;;
+  *) FM_STATE_OVERRIDE=$state bash -c '. "$1/bin/fm-wake-lib.sh"; fm_wake_append check "$2" "$2"' _ "${FM_TEST_ROOT:?}" "$key" && printf '%s\n' "$key" ;;
+esac
+exit 0
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_TEST_ROOT="$ROOT" FM_TANGLE_ROOT="$TMP_ROOT/watch-checks/tangle" \
+    FM_OMP_ARM_READY_TIMEOUT_MS=3000 FM_WATCH_REARM_RETRY_LIMIT=1 FM_WATCH_REARM_RETRY_BASE_MS=5 FM_WATCH_REARM_RETRY_MAX_MS=10 \
+    EXT="$repo/.omp/extensions/fm-primary-omp-watch.ts" node --input-type=module 2>&1 <<'EOF'
+import { pathToFileURL } from "node:url";
+import { writeFileSync, readFileSync, existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+const home = process.env.FM_HOME;
+const state = `${home}/state`;
+writeFileSync(`${state}/.lock`, `${process.pid}\n`);
+const handlers = new Map(); let tool = null; const sent = [];
+const pi = {
+  on(e, h) { handlers.set(e, h); },
+  registerCommand() {},
+  registerTool(t) { tool = t; },
+  sendUserMessage(m, o) { sent.push({ m, o }); return undefined; },
+};
+let idle = false;
+const ctx = { agent: { kind: "main" }, isIdle: () => idle };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const cycle = () => (existsSync(`${state}/.cycle`) ? Number(readFileSync(`${state}/.cycle`, "utf8").trim()) : 0);
+const assert = (ok, message) => { if (!ok) throw new Error(message); };
+async function fire(key) {
+  for (let i = 0; i < 100 && cycle() === 0; i += 1) await sleep(50);
+  const c = cycle();
+  assert(c > 0, "the watcher cycle never started");
+  writeFileSync(`${state}/.fire-${c}`, key);
+  for (let i = 0; i < 100 && cycle() === c; i += 1) await sleep(50);
+  assert(cycle() > c, `no successor cycle started after ${key}`);
+  await sleep(250);
+}
+function runDrain(args) {
+  const result = spawnSync("bash", [`${process.env.FM_TEST_ROOT}/bin/fm-wake-drain.sh`, ...args], {
+    encoding: "utf8",
+    env: { ...process.env, FM_STATE_OVERRIDE: state, FM_ROOT_OVERRIDE: process.env.FM_TANGLE_ROOT },
+  });
+  assert(result.status === 0, `the drain failed: ${result.stdout}${result.stderr}`);
+  return `${result.stdout}\n${result.stderr}`;
+}
+function drain(ack) {
+  const out = runDrain([]);
+  const rows = out.split("\n").filter((l) => /^[0-9]+\t[0-9]+\tcheck\t/.test(l)).map((l) => l.split("\t")[4]);
+  const cmd = out.match(/^WAKE_ACK_REQUIRED: .*run bin\/fm-wake-drain\.sh (--ack-through [0-9]+ --recovery-generation \S+)$/m);
+  if (ack && cmd) runDrain(cmd[1].split(" "));
+  return { rows, needsAck: Boolean(cmd) };
+}
+async function emit(name, event) {
+  const handler = handlers.get(name);
+  if (handler) await handler(event, ctx);
+}
+async function startRun(prompt) {
+  idle = false;
+  await emit("before_agent_start", { type: "before_agent_start", prompt });
+  await emit("agent_start", { type: "agent_start" });
+}
+async function endRun() {
+  idle = true;
+  await emit("agent_end", { type: "agent_end" });
+  await sleep(100);
+}
+const mod = await import(pathToFileURL(process.env.EXT).href);
+mod.default(pi);
+await handlers.get("session_start")({ type: "session_start" }, ctx);
+await sleep(300);
+const generic = (out) => `check: ${state}/nightly.check.sh: ${out}`;
+const C1 = generic("all green");
+const C2 = "check: secondmate sm-1 auto-relaunched after missing (tmux: no pane)";
+const C3 = "check: secondmate wake-loop stalled: mate=sm-1 row=7 idle=95s";
+const C4 = `check: rejected unauthenticated state checks: ${state}/x-watch.check.sh`;
+// 1. A burst of row-backed check closes lands while main is busy. One drain
+//    acknowledges every row, so the queued follow-ups must retire silently.
+await fire(C1);
+assert(sent.length === 1 && sent[0].m.includes(C1), `the first check close must reach omp at once: ${JSON.stringify(sent)}`);
+await startRun(sent[0].m);
+await fire(C2);
+await fire(C3);
+await fire(C4);
+assert(sent.length === 1, `check closes during a busy run must be held, not delivered: ${sent.map((s) => s.m)}`);
+let first = drain(true);
+assert(first.rows.join("\n") === [C1, C2, C3, C4].join("\n") && first.needsAck, `one drain must present the whole check burst: ${JSON.stringify(first)}`);
+await endRun();
+assert(sent.length === 1, `acknowledged check rows started another turn: ${sent.length - 1} redundant follow-up(s)`);
+assert(drain(true).rows.length === 0, "the rows of the check burst were not all acknowledged");
+// 2. A genuinely new check row after the drain is delivered exactly once.
+await startRun("operator prompt");
+const C5 = generic("changed");
+const C6 = generic("changed again");
+await fire(C5);
+await fire(C6);
+first = drain(true);
+assert(first.rows.join("\n") === [C5, C6].join("\n"), `unexpected drain rows: ${JSON.stringify(first)}`);
+const C7 = generic("one more");
+await fire(C7);
+await endRun();
+assert(sent.length === 2, `the genuinely new check close must be delivered exactly once: ${sent.slice(1).map((s) => s.m)}`);
+assert(sent[1].m.includes(C7) && !sent[1].m.includes(C5) && !sent[1].m.includes(C6), `the new check wake named drained rows: ${sent[1].m}`);
+await startRun(sent[1].m);
+const second = drain(true);
+assert(second.rows.join("\n") === C7, `the delivered check wake must find exactly the new row: ${JSON.stringify(second)}`);
+await endRun();
+assert(sent.length === 2, "handling the new check wake started another turn");
+// 3. Check handbacks with no queue row are always delivered, idle or busy,
+//    and never retire: the merged outcome is the closest boundary, because it
+//    shares the "<path>.check.sh: ..." shape with a row-backed result.
+const NOROW = (reason) => `NOROW:${reason}`;
+const N = [
+  `check: ${state}/pr.check.sh: merged`,
+  "check: rearm-resurface",
+  "check: inactive-outcome",
+  "check: contributions pronto: 2 open upstream",
+  "check: process-event result captured: procevent:nightly:7",
+];
+for (const reason of N) {
+  const before = sent.length;
+  await fire(NOROW(reason));
+  assert(sent.length === before + 1 && sent[sent.length - 1].m.includes(reason), `a non-queue check handback was not delivered at once: ${reason}`);
+}
+const idleSends = sent.length;
+await startRun("operator prompt");
+await fire(NOROW(N[0]));
+assert(sent.length === idleSends + 1 && sent[sent.length - 1].m.includes(N[0]), "a non-queue check handback was held behind a busy main");
+await endRun();
+// 4. A presented but never acknowledged check row stays owed.
+await startRun("operator prompt");
+const C8 = generic("owed row");
+await fire(C8);
+drain(false);
+await endRun();
+assert(sent[sent.length - 1].m.includes(C8), `an unacknowledged check row lost its wake: ${JSON.stringify(sent.slice(-1))}`);
+await startRun(sent[sent.length - 1].m);
+assert(drain(true).rows.join("\n") === C8, "the unacknowledged check row was not presented again");
+await endRun();
+await handlers.get("session_shutdown")({}, ctx);
+process.exit(0);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "omp watch extension row-backed check gate: $out"
+  [ -z "$out" ] || fail "omp watch extension row-backed check gate test printed output: $out"
+  pass ".omp watch extension: row-backed check wakes retire after acknowledgement while non-queue check handbacks still deliver"
+}
 
 test_subagent_bindings_cannot_take_primary_supervision() {
   local repo home out status
@@ -1304,3 +1478,4 @@ test_watch_extension_keeps_the_arm_without_the_file_or_with_off
 test_watch_extension_replays_a_host_only_boundary_across_replacement
 test_watch_extension_delivers_a_split_host_close_whole
 test_watch_extension_skips_wakes_main_already_drained
+test_watch_extension_retires_row_backed_check_wakes

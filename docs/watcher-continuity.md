@@ -78,10 +78,10 @@ omp's replacement follows its own generation-owner contract in `.omp/extensions/
 
 omp hands queued follow-ups to the model one at a time, and one drain presents and acknowledges every queued row.
 A wake handed to omp while main is mid-run, or while an earlier wake is still queued, would therefore start a turn whose drain finds nothing.
-The extension holds a signal, stale, or heartbeat wake until main's run ends, then judges it against the durable queue.
+The extension holds a signal, stale, heartbeat, or producer-proven row-backed check wake until main's run ends, then judges it against the durable queue.
 Each such wake carries the queue's highest sequence at the moment its close was observed, and it is retired without a turn once no queued row at or below that sequence remains.
 Wakes still owed are delivered together as one follow-up.
-Everything else is delivered immediately and unjudged: a check line, a supervision-host handback, and a wake carrying a continuity-failure appendix.
+Delivered immediately and unjudged: any other check line (a merged outcome, rearm-resurface, inactive-outcome, contribution output, or process-event surface), a supervision-host handback, and a wake carrying a continuity-failure appendix.
 A record without a watermark, an unreadable queue, or a presented-but-unacknowledged row also delivers, so an unhandled event is never dropped.
 The same judgment runs when a replacement session replays an unconsumed wake.
 The extension header owns how the run state is tracked and how a missed `agent_end` is recovered.

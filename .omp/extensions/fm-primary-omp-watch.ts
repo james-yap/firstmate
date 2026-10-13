@@ -64,18 +64,20 @@
 // Wake gating (stated once here; docs/watcher-continuity.md carries the summary):
 // omp delivers queued follow-ups one at a time, and one drain presents and
 // acknowledges every queued row, so a follow-up handed to omp behind a busy main
-// starts a turn whose drain finds nothing. A signal, stale, or heartbeat wake is
-// row-backed (bin/fm-watch.sh appends its row before it prints the line), so
-// each such record carries the queue's highest sequence at its close
-// (queueSeq). While main is mid-run, or an earlier wake is still queued in omp,
-// the wake is held in unconsumedWakes with no text handed over. A final
+// starts a turn whose drain finds nothing. A signal, stale, or heartbeat wake,
+// and a check wake in one of the producer-proven row-backed shapes owned by
+// rowBackedCheckMessage, are row-backed (bin/fm-watch.sh appends its row before
+// it prints the line), so each such record carries the queue's highest sequence
+// at its close (queueSeq). While main is mid-run, or an earlier wake is still
+// queued in omp, the wake is held in unconsumedWakes with no text handed over. A final
 // agent_end (willContinue not true, the same busy edge bin/fm-spawn.sh's
 // per-task busy extension uses) judges the held wakes: one with no queued row
 // at or below its queueSeq is retired, and the rest ride one follow-up whose
 // replayable record is the latest watermark. A wake is judged the same way just
 // before any send and when a replacement replays it. Unjudged and always
-// delivered: check lines, supervision-host lines, a failure appendix, a record
-// without a watermark, and any queue the extension cannot read. A wake handed
+// delivered: a check line outside the row-backed shapes, supervision-host lines,
+// a failure appendix, a record without a watermark, and any queue the extension
+// cannot read. A wake handed
 // to omp ages out of the queue at the next final agent_end (runEpoch), because
 // omp either consumed it or never will. A run flag or queued wake outliving a
 // missed agent_end is cleared by the hold timer after three consecutive
@@ -370,11 +372,35 @@ function nodeErrorCode(error: unknown): string {
 // A wake whose whole message is one signal, stale, or heartbeat reason line is
 // row-backed: bin/fm-watch.sh appends its durable queue row before it prints
 // the line, so a drain that has acknowledged every row up to the close has
-// already presented everything the wake announces. A check line can announce a
-// durable record outside the queue, a host line is the host's own handback, and
-// a failure appendix is new information; none of those is ever judged obsolete.
+// already presented everything the wake announces. The same holds for a check
+// line in one of the producer-proven row-backed shapes below. Any other check
+// line announces a durable record outside the queue, a host line is the host's
+// own handback, and a failure appendix is new information; none of those is
+// ever judged obsolete. A new append-then-wake check producer must extend the
+// shapes below: an unknown check line is delivered, never retired.
 function rowBackedMessage(message: string): boolean {
-  return /^(signal:|stale:|heartbeat($|:))[^\n]*$/.test(message);
+  if (/^(signal:|stale:|heartbeat($|:))[^\n]*$/.test(message)) return true;
+  return rowBackedCheckMessage(message);
+}
+
+// Check wakes whose producer appended a durable queue row before printing the
+// reason line, verified against bin/fm-watch.sh's append-then-wake sites: a
+// registered check output (including a PR-poll result) prints
+// "check: <state-path>.check.sh: <output>"; the secondmate wake-loop and
+// liveness ticks and the rejected-authentication paths print their own fixed
+// "check: ..." reasons beside the append. Everything else stays unjudged: a
+// merged PR outcome is published durably without a row, and the
+// rearm-resurface, inactive-outcome, contribution-output, and process-event
+// surface wakes own no row either, so each must still reach main at once.
+function rowBackedCheckMessage(message: string): boolean {
+  // The merged outcome shares the "<path>.check.sh: ..." shape with a
+  // row-backed result but carries no row, so it is excluded first.
+  if (/^check: .+\.check\.sh: merged$/.test(message)) return false;
+  if (/^check: .+\.check\.sh: /.test(message)) return true;
+  if (/^check: secondmate wake-loop stalled: /.test(message)) return true;
+  if (/^check: secondmate [A-Za-z0-9._-]+ auto-relaunch(ed after| failed after| paused after) /.test(message)) return true;
+  if (/^check: rejected unauthenticated /.test(message)) return true;
+  return false;
 }
 
 // The queue's highest appended sequence. A queue that never appended a row has
@@ -1406,10 +1432,10 @@ export default function (pi: ExtensionAPI) {
     pi.registerTool?.({
       name: "fm_watch_arm_omp",
       label: "Arm firstmate watcher",
-      description: "Start the first required omp watcher cycle, or repair one only after a notification says the cycle is missing, failed, or unhealthy. Do not call after ordinary work or ordinary notifications; the omp extension re-arms automatically. Never run bin/fm-watch-arm.sh through bash.",
-      promptSnippet: "Start the first required omp watcher cycle or repair a cycle reported missing, failed, or unhealthy; ordinary re-arming is automatic.",
+      description: "Repair the omp watcher cycle only after a notification says the cycle is missing, failed, or unhealthy. The extension arms the first cycle automatically after native startup; do not call after ordinary work or ordinary notifications. Never run bin/fm-watch-arm.sh through bash.",
+      promptSnippet: "Repair a cycle reported missing, failed, or unhealthy; the first cycle arms automatically and ordinary re-arming is automatic.",
       promptGuidelines: [
-        "Call fm_watch_arm_omp only for the first required cycle or after a notification says the cycle is missing, failed, or unhealthy. Do not call it after ordinary work, turn completion, or ordinary signal, stale, check, or heartbeat handling because the omp extension owns re-arming. Never run bin/fm-watch-arm.sh through bash.",
+        "Call fm_watch_arm_omp only after a notification says the cycle is missing, failed, or unhealthy. Do not call it for the first cycle, after ordinary work, turn completion, or ordinary signal, stale, check, or heartbeat handling because the omp extension owns arming and re-arming. Never run bin/fm-watch-arm.sh through bash.",
       ],
       parameters: Type.Object({}),
       execute: async (_toolCallId: string, _params: unknown, _signal: unknown, _onUpdate: unknown, ctx: AgentContext) => {
