@@ -28,7 +28,7 @@
 // for the Run tier.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 // Shared with the Pi extensions; the owner resolves bin/fm-operational-input.sh
@@ -44,6 +44,7 @@ import {
 type ExtensionAPI = {
   on?: (event: string, handler: (event: any, ctx: any) => unknown) => void;
   sendMessage?: (message: unknown) => void;
+  events?: { emit: (event: string, ctx: unknown) => void };
 };
 
 type LockOwnership = "owned" | "missing" | "other";
@@ -89,7 +90,8 @@ function lockOwnership(): LockOwnership {
 }
 
 function markLoaded(): void {
-  if (!existsSync(state) || lockOwnership() === "other") return;
+  if (lockOwnership() === "other") return;
+  mkdirSync(state, { recursive: true });
   writeFileSync(marker, `${extensionVersion}\n${process.pid}\n`);
 }
 
@@ -535,9 +537,15 @@ export default function (pi: ExtensionAPI) {
     process.removeListener("exit", cleanupSessionstartOnProcessExit);
     sessionstartExitListenerRegistered = false;
   };
-  registerSessionstartExitListener();
+
+  async function publishSessionstartCompletion(generation: SessionstartGeneration, ctx: SessionStartContext): Promise<void> {
+    await generation.result;
+    if (!sessionstartGenerationIsLive(generation)) return;
+    pi.events?.emit("firstmate:omp-sessionstart-complete", ctx);
+  }
 
   pi.on?.("session_start", (_event, ctx) => {
+    if (ctx?.agent?.kind !== "main") return;
     sessionStarts += 1;
     const source: SessionstartSource = sessionStarts === 1
       ? (launchResumeSource() ?? "startup")
@@ -545,9 +553,11 @@ export default function (pi: ExtensionAPI) {
     markLoaded();
     registerSessionstartExitListener();
     sessionstartGeneration = createSessionstartGeneration(source, sessionIdFromContext(ctx));
+    void publishSessionstartCompletion(sessionstartGeneration, ctx);
   });
 
   pi.on?.("before_agent_start", async (_event, ctx) => {
+    if (ctx?.agent?.kind !== "main") return;
     const generation = sessionstartGeneration;
     if (!generation) return undefined;
     const message = await claimSessionstartMessage(generation, ctx);
@@ -558,9 +568,11 @@ export default function (pi: ExtensionAPI) {
   // is idle and auto-compaction may retry without another before_agent_start,
   // so the message is sent directly while sharing generation ownership.
   pi.on?.("session_compact", async (_event, ctx) => {
+    if (ctx?.agent?.kind !== "main") return;
     registerSessionstartExitListener();
     const generation = createSessionstartGeneration("compact", sessionIdFromContext(ctx));
     sessionstartGeneration = generation;
+    await publishSessionstartCompletion(generation, ctx);
     const message = await claimSessionstartMessage(generation, ctx);
     if (!message || !sessionstartGenerationIsLive(generation)) return;
     try {
@@ -570,7 +582,8 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on?.("session_shutdown", async () => {
+  pi.on?.("session_shutdown", async (_event, ctx) => {
+    if (ctx?.agent?.kind !== "main") return;
     const generation = sessionstartGeneration;
     try {
       if (generation) await stopSessionstartGeneration(generation);
@@ -580,7 +593,9 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on?.("tool_call", async (event) => {
+  pi.on?.("tool_call", async (event, _ctx) => {
+    // Advisor bash arrives on the primary session with kind "sub". The seatbelt
+    // still applies; only supervision delivery and repair stay primary-only.
     if (!event || event.type !== "tool_call" || event.toolName !== "bash") return {};
     const command = String((event.input as { command?: unknown })?.command ?? "");
     if (!command) return {};
@@ -596,7 +611,8 @@ export default function (pi: ExtensionAPI) {
   // The blocking turn boundary. Returning undefined lets the session settle;
   // returning { continue: true, additionalContext } compels one more agent
   // loop with the guard text attached (verified on omp 18.1.2 and 18.1.11).
-  pi.on?.("session_stop", async (event) => {
+  pi.on?.("session_stop", async (event, ctx) => {
+    if (ctx?.agent?.kind !== "main") return undefined;
     const stopHookActive = Boolean(event && (event as { stop_hook_active?: unknown }).stop_hook_active === true);
     const result = await runGuard(stopHookActive);
     if (result.code !== 2) return undefined;
@@ -616,5 +632,4 @@ export default function (pi: ExtensionAPI) {
     return { continue: true, additionalContext: content };
   });
 
-  markLoaded();
 }

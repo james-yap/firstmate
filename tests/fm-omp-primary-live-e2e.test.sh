@@ -9,8 +9,9 @@
 #   1. both tracked .omp/extensions load by auto-discovery alone;
 #   2. the session-start digest reaches model context before the first turn
 #      and the session lock names the omp process (ancestry detection);
-#   3. fm_watch_arm_omp starts a real watcher, an actionable close spawns a
-#      ledger-linked successor, and the wake arrives as one follow-up turn;
+#   3. startup arms a real watcher on its own and fm_watch_arm_omp is an
+#      idempotent no-op, an actionable close spawns a ledger-linked successor,
+#      and the wake arrives as one follow-up turn;
 #   4. closes that land during one busy run, all acknowledged by that run's one
 #      drain, reach main as no wake, while a new event afterwards reaches main
 #      exactly once;
@@ -222,15 +223,28 @@ omp_real_pid=$(pgrep -P "$OMP_PID" -x omp 2>/dev/null | head -1 || true)
 pass "omp $OMP_VERSION: before_agent_start delivered the digest into model context and the lock names the omp process"
 
 # --- 2. watcher arm, successor, and wake delivery ------------------------------
+# Native startup acquires the lock and the extension arms on its own: a live
+# watcher exists before the model calls anything, and the tool the model then
+# calls is an idempotent ownership no-op, not the first arm.
 : > "$PROJECT/state/omp-e2e.meta"
+i=0
+while [ "$i" -lt 120 ]; do
+  startup_watcher_pid=$(cat "$PROJECT/state/.watch.lock/pid" 2>/dev/null || true)
+  [ -n "$startup_watcher_pid" ] && kill -0 "$startup_watcher_pid" 2>/dev/null && break
+  sleep 0.5
+  i=$((i + 1))
+done
+{ [ -n "${startup_watcher_pid:-}" ] && kill -0 "$startup_watcher_pid" 2>/dev/null; } \
+  || fail "startup did not arm a live watcher before any tool call: $(tail -3 "$RPC_ERR")"
 rpc_send '{"id":"p2","type":"prompt","message":"Call the fm_watch_arm_omp tool exactly once now, then reply with its result text verbatim and nothing else. Never run bin/fm-watch-arm.sh through bash."}'
-wait_for_log "watcher: started omp extension arm child 1" 360 || fail "omp did not render the initial watcher tool result: $(tail -3 "$RPC_ERR")"
+wait_for_log "watcher: unchanged - omp extension already owns an arm child" 360 || fail "the arm tool was not an idempotent ownership no-op after startup arming: $(tail -3 "$RPC_ERR")"
 wait_for_agent_ends 2 360 || fail "omp did not finish the arm turn"
 watcher_pid=$(cat "$PROJECT/state/.watch.lock/pid" 2>/dev/null || true)
 if [ -z "$watcher_pid" ] || ! kill -0 "$watcher_pid" 2>/dev/null; then
-  fail "no live watcher holds the lab home lock after fm_watch_arm_omp"
+  fail "no live watcher holds the lab home lock after the arm tool call"
 fi
-pass "omp $OMP_VERSION: fm_watch_arm_omp started a live watcher through the extension"
+[ "$watcher_pid" = "$startup_watcher_pid" ] || fail "the arm tool replaced the startup-armed watcher ($startup_watcher_pid -> $watcher_pid)"
+pass "omp $OMP_VERSION: startup armed a live watcher and fm_watch_arm_omp was an idempotent no-op"
 
 printf 'done: omp live e2e watcher fire\n' > "$PROJECT/state/omp-e2e.status"
 i=0
