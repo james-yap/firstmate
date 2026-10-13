@@ -9,9 +9,13 @@
 #   1. both tracked .omp/extensions load by auto-discovery alone;
 #   2. the session-start digest reaches model context before the first turn
 #      and the session lock names the omp process (ancestry detection);
-#   3. fm_watch_arm_omp starts a real watcher, an actionable close spawns a
-#      ledger-linked successor, and the wake arrives as one follow-up turn;
-#   4. with the successor watcher frozen until its beacon passes the lab grace,
+#   3. startup arms a real watcher on its own and fm_watch_arm_omp is an
+#      idempotent no-op, an actionable close spawns a ledger-linked successor,
+#      and the wake arrives as one follow-up turn;
+#   4. closes that land during one busy run, all acknowledged by that run's one
+#      drain, reach main as no wake, while a new event afterwards reaches main
+#      exactly once;
+#   5. with the successor watcher frozen until its beacon passes the lab grace,
 #      the next turn end is genuinely unsupervised, so session_stop must compel
 #      the turn-end guard continuation and the model reaches for the tool.
 set -u
@@ -219,15 +223,28 @@ omp_real_pid=$(pgrep -P "$OMP_PID" -x omp 2>/dev/null | head -1 || true)
 pass "omp $OMP_VERSION: before_agent_start delivered the digest into model context and the lock names the omp process"
 
 # --- 2. watcher arm, successor, and wake delivery ------------------------------
+# Native startup acquires the lock and the extension arms on its own: a live
+# watcher exists before the model calls anything, and the tool the model then
+# calls is an idempotent ownership no-op, not the first arm.
 : > "$PROJECT/state/omp-e2e.meta"
+i=0
+while [ "$i" -lt 120 ]; do
+  startup_watcher_pid=$(cat "$PROJECT/state/.watch.lock/pid" 2>/dev/null || true)
+  [ -n "$startup_watcher_pid" ] && kill -0 "$startup_watcher_pid" 2>/dev/null && break
+  sleep 0.5
+  i=$((i + 1))
+done
+{ [ -n "${startup_watcher_pid:-}" ] && kill -0 "$startup_watcher_pid" 2>/dev/null; } \
+  || fail "startup did not arm a live watcher before any tool call: $(tail -3 "$RPC_ERR")"
 rpc_send '{"id":"p2","type":"prompt","message":"Call the fm_watch_arm_omp tool exactly once now, then reply with its result text verbatim and nothing else. Never run bin/fm-watch-arm.sh through bash."}'
-wait_for_log "watcher: started omp extension arm child 1" 360 || fail "omp did not render the initial watcher tool result: $(tail -3 "$RPC_ERR")"
+wait_for_log "watcher: unchanged - omp extension already owns an arm child" 360 || fail "the arm tool was not an idempotent ownership no-op after startup arming: $(tail -3 "$RPC_ERR")"
 wait_for_agent_ends 2 360 || fail "omp did not finish the arm turn"
 watcher_pid=$(cat "$PROJECT/state/.watch.lock/pid" 2>/dev/null || true)
 if [ -z "$watcher_pid" ] || ! kill -0 "$watcher_pid" 2>/dev/null; then
-  fail "no live watcher holds the lab home lock after fm_watch_arm_omp"
+  fail "no live watcher holds the lab home lock after the arm tool call"
 fi
-pass "omp $OMP_VERSION: fm_watch_arm_omp started a live watcher through the extension"
+[ "$watcher_pid" = "$startup_watcher_pid" ] || fail "the arm tool replaced the startup-armed watcher ($startup_watcher_pid -> $watcher_pid)"
+pass "omp $OMP_VERSION: startup armed a live watcher and fm_watch_arm_omp was an idempotent no-op"
 
 printf 'done: omp live e2e watcher fire\n' > "$PROJECT/state/omp-e2e.status"
 i=0
@@ -243,6 +260,74 @@ wait_for_agent_ends 3 360 || fail "omp did not finish the wake turn"
 arm_calls=$(tool_call_count fm_watch_arm_omp)
 [ "$arm_calls" -eq 1 ] || fail "the model re-armed from memory instead of the extension (fm_watch_arm_omp call count $arm_calls)"
 pass "omp $OMP_VERSION: an actionable close spawned a ledger-linked successor and woke main exactly once"
+
+# --- 2b. a burst of closes while main is busy -----------------------------------
+# Three actionable closes land while main sits inside one long tool call. The
+# one drain main runs afterwards presents and acknowledges all three rows, so
+# omp must not be handed a follow-up per close: each would queue behind the run
+# and start a turn whose drain finds nothing. The signal rows are the real
+# watcher's; the cycle ledger proves the closes happened rather than the stage
+# passing vacuously.
+bash_call_count() {
+  local n
+  n=$(jq -r 'select(.type == "tool_execution_start" and .toolName == "bash") | .type' "$RPC_LOG" 2>/dev/null | grep -c . 2>/dev/null) || true
+  printf '%s' "${n:-0}"
+}
+signal_exit_count() {
+  local n
+  n=$(grep -c 'reason=actionable-signal' "$PROJECT/state/.watch-cycle-exits.log" 2>/dev/null) || true
+  printf '%s' "${n:-0}"
+}
+# User messages main actually received whose text is a signal wake matching <pattern>
+# (the real queue of omp, not the queue_update echoes of a follow-up still waiting).
+wake_message_count() {  # <pattern>
+  local n
+  n=$(jq -r 'select(.type == "message_start" and .message.role == "user") | (.message.content | if type == "string" then . else map(.text // "") | join("\n") end)' "$RPC_LOG" 2>/dev/null | grep -c "FIRSTMATE WATCHER WAKE: signal:.*$1" 2>/dev/null) || true
+  printf '%s' "${n:-0}"
+}
+exits_before=$(signal_exit_count)
+bash_before=$(bash_call_count)
+for n in 1 2 3 4; do : > "$PROJECT/state/omp-burst-$n.meta"; done
+rpc_send '{"id":"p4","type":"prompt","message":"Run exactly one bash command: sleep 24. When it returns, run bin/fm-wake-drain.sh, and if its output contains a WAKE_ACK_REQUIRED line run exactly the acknowledgement command that line names. Then reply with exactly BURST_DONE and nothing else."}'
+i=0
+while [ "$i" -lt 360 ] && [ "$(bash_call_count)" -le "$bash_before" ]; do
+  sleep 0.5
+  i=$((i + 1))
+done
+[ "$(bash_call_count)" -gt "$bash_before" ] || fail "main never started the long tool call the burst needs: $(tail -3 "$RPC_ERR")"
+for n in 1 2 3; do
+  printf 'done: omp live e2e burst %s\n' "$n" > "$PROJECT/state/omp-burst-$n.status"
+  sleep 4
+done
+i=0
+while [ "$i" -lt 60 ] && [ "$(signal_exit_count)" -lt $((exits_before + 3)) ]; do
+  sleep 0.5
+  i=$((i + 1))
+done
+[ "$(signal_exit_count)" -ge $((exits_before + 3)) ] || fail "the watcher did not close three times during the busy run (closes: $(( $(signal_exit_count) - exits_before )))"
+wait_for_agent_ends 4 360 || fail "omp did not finish the busy run: $(tail -3 "$RPC_ERR")"
+# A follow-up queued behind the run would have reached main by now.
+sleep 12
+[ "$(agent_end_count)" -eq 4 ] || fail "closes whose rows main already acknowledged started $(( $(agent_end_count) - 4 )) extra turn(s)"
+[ "$(wake_message_count omp-burst)" -eq 0 ] \
+  || fail "$(wake_message_count omp-burst) wake(s) for already acknowledged burst rows reached main"
+[ "$(jq -r 'select(.type == "tool_execution_start" and .toolName == "bash") | .args.command // ""' "$RPC_LOG" 2>/dev/null | grep -c 'wake-drain')" -ge 1 ] \
+  || fail "main never ran the drain for the burst"
+pass "omp $OMP_VERSION: three closes during one busy run were acknowledged by one drain and no wake for them reached main"
+
+# --- 2c. a new event after the burst still wakes main -----------------------------
+printf 'done: omp live e2e after the burst\n' > "$PROJECT/state/omp-burst-4.status"
+i=0
+while [ "$i" -lt 240 ] && [ "$(wake_message_count omp-burst-4)" -lt 1 ]; do
+  sleep 0.5
+  i=$((i + 1))
+done
+[ "$(wake_message_count omp-burst-4)" -ge 1 ] || fail "the wake for the new event never reached main"
+wait_for_agent_ends 5 360 || fail "omp did not finish the turn for the new event"
+sleep 8
+[ "$(wake_message_count omp-burst-4)" -eq 1 ] || fail "the new event reached main $(wake_message_count omp-burst-4) times instead of once"
+[ "$(agent_end_count)" -eq 5 ] || fail "the new event started $(( $(agent_end_count) - 4 )) turns instead of one"
+pass "omp $OMP_VERSION: a genuinely new event after the burst reached main exactly once and started exactly one turn"
 
 # --- 3. the compelled turn-end guard continuation -------------------------------
 # Freeze the successor watcher (SIGSTOP) so its beacon goes stale past the lab
@@ -283,7 +368,7 @@ while [ "$i" -lt 360 ]; do
 done
 [ "$(tool_call_count fm_watch_arm_omp)" -ge 2 ] \
   || { thaw; fail "the model did not reach for fm_watch_arm_omp after the compelled continuation"; }
-wait_for_agent_ends 4 360 || { thaw; fail "omp did not settle after the compelled continuation"; }
+wait_for_agent_ends 6 360 || { thaw; fail "omp did not settle after the compelled continuation"; }
 thaw
 sleep 3
 repaired_pid=$(cat "$PROJECT/state/.watch.lock/pid" 2>/dev/null || true)

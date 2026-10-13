@@ -74,6 +74,19 @@ omp's replacement follows its own generation-owner contract in `.omp/extensions/
 - It retires the predecessor arm at replacement shutdown instead of retaining it across the handoff.
 - It reports no shutdown reason, so every shutdown with a pending actionable close persists the handoff for the next owning `session_start` to replay.
 
+### omp wake delivery to a busy main
+
+omp hands queued follow-ups to the model one at a time, and one drain presents and acknowledges every queued row.
+A wake handed to omp while main is mid-run, or while an earlier wake is still queued, would therefore start a turn whose drain finds nothing.
+The extension holds a signal, stale, heartbeat, or producer-proven row-backed check wake until main's run ends, then judges it against the durable queue.
+Each such wake carries the queue's highest sequence at the moment its close was observed, and it is retired without a turn once no queued row at or below that sequence remains.
+Wakes still owed are delivered together as one follow-up.
+Delivered immediately and unjudged: any other check line (a merged outcome, rearm-resurface, inactive-outcome, contribution output, or process-event surface), a supervision-host handback, and a wake carrying a continuity-failure appendix.
+A record without a watermark, a queue that fails to read or parse, or a presented-but-unacknowledged row also delivers, so an unhandled event is never dropped.
+A queue file that was never created holds no rows, so only then is there nothing to deliver.
+The same judgment runs when a replacement session replays an unconsumed wake.
+The extension header owns how the run state is tracked and how a missed `agent_end` is recovered.
+
 ### Cursor stop hook
 
 Cursor's `.cursor/hooks.json` `stop` hook (`bin/fm-turnend-guard-cursor.sh`) owns routine tokenless re-arm for a Cursor primary.
