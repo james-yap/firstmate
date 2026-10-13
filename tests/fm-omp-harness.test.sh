@@ -462,7 +462,7 @@ test_turnend_guard_extension_compels_one_continuation() {
   local repo home out status
   repo="$TMP_ROOT/guard/repo"; home="$TMP_ROOT/guard/home"
   install_omp_extension_fixture "$repo"
-  mkdir -p "$home/state"
+  mkdir -p "$home"
   cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
 #!/usr/bin/env bash
 payload=$(cat); printf '%s\n' "$payload" >> "${FM_GUARD_LOG:?}"
@@ -877,9 +877,10 @@ EOF
 
 test_subagent_bindings_cannot_take_primary_supervision() {
   local repo home out status
-  repo="$TMP_ROOT/subagent/repo"; home="$TMP_ROOT/subagent/home"
+  local order=${1:-watch-first}
+  repo="$TMP_ROOT/subagent-$order/repo"; home="$TMP_ROOT/subagent-$order/home"
   install_omp_extension_fixture "$repo"
-  mkdir -p "$home/state"
+  mkdir -p "$home"
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
 [ "${1:-}" = --handling-delivered ] && exit 0
@@ -891,15 +892,24 @@ printf 'signal: isolated subagent regression\n'
 SH
   cat > "$repo/bin/fm-sessionstart-run.sh" <<'SH'
 #!/usr/bin/env bash
+[ -f "$FM_HOME/state/.omp-watch-extension-loaded" ] || exit 1
+[ -f "$FM_HOME/state/.omp-turnend-extension-loaded" ] || exit 1
+while [ ! -f "$FM_HOME/allow-startup" ]; do sleep 0.1; done
+owner=$(cat "$FM_HOME/state/.lock" 2>/dev/null || true)
+[ -z "$owner" ] || [ "$owner" = "$FM_TEST_OWNER_PID" ] || exit 3
+printf '%s\n' "$FM_TEST_OWNER_PID" > "$FM_HOME/state/.lock"
 printf '%s\n' "$*" >> "$FM_HOME/digests"
 printf 'PRIMARY DIGEST\n'
 SH
   chmod +x "$repo/bin/"*.sh
-  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" EXT_DIR="$repo/.omp/extensions" node --input-type=module 2>&1 <<'JS'
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" EXT_DIR="$repo/.omp/extensions" FM_TEST_EXTENSION_ORDER="$order" node --input-type=module 2>&1 <<'JS'
 import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
+import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 const home = process.env.FM_HOME;
+process.env.FM_TEST_OWNER_PID = String(process.pid);
 const watch = (await import(pathToFileURL(`${process.env.EXT_DIR}/fm-primary-omp-watch.ts`).href)).default;
 const guard = (await import(pathToFileURL(`${process.env.EXT_DIR}/fm-primary-turnend-guard.ts`).href)).default;
 const pause = () => new Promise(r => setTimeout(r, 50));
@@ -912,13 +922,15 @@ function bind(kind, id, depth = 0) {
   const ctx = { agent: { kind, id, name: kind === "main" ? "main" : "scout", depth },
     sessionManager: { getSessionId: () => id } };
   const api = {
+    events: new EventEmitter(),
     on(event, handler) { const list = handlers.get(event) ?? []; list.push(handler); handlers.set(event, list); },
     registerTool(tool) { tools.push(tool); },
     registerCommand(name, command) { commands.push(command); },
     sendMessage(message) { messages.push(message.content); },
     sendUserMessage(message) { messages.push(message); },
   };
-  watch(api); guard(api);
+  if (process.env.FM_TEST_EXTENSION_ORDER === "guard-first") { guard(api); watch(api); }
+  else { watch(api); guard(api); }
   return { ctx, tools, commands, messages, async emit(type, data = {}, context = ctx) {
     const results = [];
     for (const h of handlers.get(type) ?? []) results.push(await h({ type, ...data }, context));
@@ -939,11 +951,20 @@ await assertInert(bind("sub", "early", 1));
 assert(!existsSync(`${home}/digests`));
 assert(!existsSync(`${home}/state/.omp-watch-extension-loaded`));
 assert(!existsSync(`${home}/state/.omp-turnend-extension-loaded`));
-writeFileSync(`${home}/state/.lock`, `${process.pid}\n`);
+assert(!existsSync(`${home}/state`), "inert factories must not create state");
 const main = bind("main", "primary");
 await main.emit("session_start");
+assert(existsSync(`${home}/state/.omp-turnend-extension-loaded`), "guard must publish its fresh-home marker");
+assert(existsSync(`${home}/state/.omp-watch-extension-loaded`), "watch must publish its fresh-home marker");
+assert.equal(main.tools.length, 0, "missing lock must not expose the arm tool");
+assert.equal(main.commands.length, 0, "missing lock must not expose the arm command");
+await assertInert(bind("sub", "during-startup", 1));
+writeFileSync(`${home}/allow-startup`, "");
 const digest = await main.emit("before_agent_start", { prompt: "start" });
 assert(digest.some(r => r?.message?.content.includes("PRIMARY DIGEST")));
+assert.equal(readFileSync(`${home}/state/.lock`, "utf8").trim(), String(process.pid));
+assert.equal(main.tools.length, 1, "native lock acquisition must expose the owner tool");
+assert.equal(main.commands.length, 1, "native lock acquisition must expose the owner command");
 await until(() => existsSync(`${home}/arms`), "primary arm");
 const firstArm = readFileSync(`${home}/arms`, "utf8");
 const digestRuns = readFileSync(`${home}/digests`, "utf8");
@@ -955,6 +976,9 @@ await assertInert(bind(undefined, "unknown"));
 assert.equal(readFileSync(`${home}/arms`, "utf8"), firstArm);
 assert.equal(readFileSync(`${home}/digests`, "utf8"), digestRuns);
 const repair = await main.tools[0].execute("repair", {}, undefined, undefined, main.ctx);
+const denied = await main.tools[0].execute("child-arm", {}, undefined, undefined, { agent: { kind: "sub" } });
+assert.equal(denied.details.ok, false, "parent-bound tool must reject child contexts");
+await main.commands[0].handler("", main.ctx);
 assert.equal(repair.details.ok, true, "disposing children must not disable primary repair");
 writeFileSync(`${home}/fire`, "");
 await until(() => main.messages.length === 1, "primary wake after child disposal");
@@ -973,15 +997,39 @@ assert.equal(main.messages[1], main.messages[0]);
 await main.emit("before_agent_start", { prompt: main.messages[1] });
 await main.emit("session_shutdown");
 assert(!existsSync(handoff), "consumed wake must not replay again");
+const holder = spawn("sleep", ["60"], { stdio: "ignore" });
+try {
+  writeFileSync(`${home}/state/.lock`, `${holder.pid}\n`);
+  const markers = [".omp-watch-extension-loaded", ".omp-turnend-extension-loaded"]
+    .map(name => readFileSync(`${home}/state/${name}`, "utf8"));
+  const arms = readFileSync(`${home}/arms`, "utf8");
+  const contender = bind("main", "non-owner");
+  for (const event of ["session_start", "session_compact", "session_start"]) {
+    await contender.emit(event);
+    await contender.emit("before_agent_start", { prompt: "refused" });
+    assert.equal(contender.tools.length, 0, "another live owner must prevent tool exposure");
+    assert.equal(contender.commands.length, 0, "another live owner must prevent command exposure");
+  }
+  await contender.emit("session_shutdown");
+  assert.deepEqual(contender.messages, []);
+  assert.equal(readFileSync(`${home}/arms`, "utf8"), arms, "non-owner must not launch an arm");
+  assert.equal(readFileSync(`${home}/state/.lock`, "utf8").trim(), String(holder.pid));
+  assert.deepEqual([".omp-watch-extension-loaded", ".omp-turnend-extension-loaded"]
+    .map(name => readFileSync(`${home}/state/${name}`, "utf8")), markers);
+} finally {
+  holder.kill();
+  await new Promise(resolve => holder.once("close", resolve));
+}
 process.exit(0);
 JS
 )
   status=$?
   expect_code 0 "$status" "omp subagent isolation: $out"
-  pass ".omp subagents: no supervision delivery or tools; primary repair and replacement handoff survive child disposal"
+  pass ".omp $order: owner-only controls, fresh-home markers, inert subagents and replacement handoff"
 }
 
 test_subagent_bindings_cannot_take_primary_supervision
+test_subagent_bindings_cannot_take_primary_supervision guard-first
 test_detection_anchored_name_and_marker_precedence
 test_lock_identity_and_liveness_classification
 test_spawn_launch_line_and_worker_wiring

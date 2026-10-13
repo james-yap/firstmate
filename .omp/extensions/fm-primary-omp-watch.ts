@@ -81,6 +81,7 @@ type ExtensionAPI = {
   sendUserMessage: (content: string, options?: { deliverAs?: string }) => unknown;
   registerCommand?: (name: string, command: { description: string; handler: (args: string, ctx: any) => Promise<void> | void }) => void;
   registerTool?: (tool: Record<string, unknown>) => void;
+  events?: { on: (event: string, handler: (ctx: AgentContext) => void) => void };
 };
 
 type AgentContext = { agent?: { kind: "main" | "sub" } };
@@ -1076,6 +1077,7 @@ export default function (pi: ExtensionAPI) {
   function activateOwnedWatch(owner: SessionGeneration): ArmResult {
     if (!generationIsLive(owner)) return { ok: false, message: shuttingDownMessage };
     if (lockOwnership() !== "owned") return startArm(owner);
+    registerControls();
     replacementCoordinator.receiver = receiveReplacementActionable;
     let pending: PendingActionableClose[] = [];
     let loadFailure = "";
@@ -1114,12 +1116,16 @@ export default function (pi: ExtensionAPI) {
     consumeWake(generation, userMessageText(message.content));
   });
 
+  pi.events?.on("firstmate:omp-sessionstart-complete", (ctx) => {
+    if (ctx?.agent?.kind !== "main" || !generation || lockOwnership() !== "owned") return;
+    activateOwnedWatch(generation);
+  });
+
   pi.on?.("session_start", async (_event, ctx) => {
     if (ctx?.agent?.kind !== "main") return;
     if (!generation || generation.stopping) generation = createGeneration();
     activateGeneration(generation);
     markLoaded();
-    registerControls();
     if (lockOwnership() !== "owned") return;
     activateOwnedWatch(generation);
   });

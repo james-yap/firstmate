@@ -8,12 +8,15 @@ set -eu
 fm_live_gate default-on FM_OMP_SUBAGENT_LIVE omp node
 LAB=$(mktemp -d "${TMPDIR:-/tmp}/fm-omp-subagent.XXXXXX")
 trap 'rm -rf "$LAB"' EXIT
-mkdir -p "$LAB/.omp/extensions" "$LAB/.pi/extensions/lib" "$LAB/bin" "$LAB/state" "$LAB/profile"
+mkdir -p "$LAB/.omp/extensions" "$LAB/.pi/extensions/lib" "$LAB/bin" "$LAB/profile"
 cp "$ROOT/.omp/extensions/"*.ts "$LAB/.omp/extensions/"
 cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$ROOT/.pi/extensions/lib/fm-sessionstart-supervisor.mjs" "$LAB/.pi/extensions/lib/"
 cp "$ROOT/bin/fm-operational-input.sh" "$ROOT/bin/fm-supervision-engine-lib.sh" "$LAB/bin/"
 cat > "$LAB/bin/fm-sessionstart-run.sh" <<'SH'
 #!/usr/bin/env bash
+[ -f "$FM_HOME/state/.omp-watch-extension-loaded" ] || exit 1
+[ -f "$FM_HOME/state/.omp-turnend-extension-loaded" ] || exit 1
+printf '%s\n' "$FM_TEST_OWNER_PID" > "$FM_HOME/state/.lock"
 printf 'digest\n' >> "$FM_HOME/digests"
 printf 'LIVE_PRIMARY_DIGEST\n'
 SH
@@ -56,12 +59,13 @@ task:
     scout: fm-local/deterministic
 YAML
 cat > "$LAB/.omp/extensions/z-live-probe.ts" <<'TS'
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 const home = process.env.FM_HOME!;
 const log = (row: unknown) => appendFileSync(`${home}/events.jsonl`, `${JSON.stringify(row)}\n`);
 let dispatched = false;
+let repaired = false;
 let fired = false;
 const delay = () => new Promise(resolve => setTimeout(resolve, 50));
 async function until(check: () => boolean, label: string) {
@@ -97,7 +101,13 @@ function installProvider(pi: ExtensionAPI) {
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
           stopReason: "stop" as "stop" | "toolUse", timestamp: Date.now(),
         };
-        if (!dispatched && !child) {
+        if (!repaired && !child) {
+          repaired = true;
+          output.stopReason = "toolUse";
+          output.content.push({ type: "toolCall", id: "owner-arm", name: "write", arguments: {
+            i: "Checking owner arm", path: "xd://fm_watch_arm_omp", content: "{}",
+          }});
+        } else if (!dispatched && !child) {
           dispatched = true;
           output.stopReason = "toolUse";
           output.content.push({ type: "toolCall", id: "spawn-child", name: "task", arguments: {
@@ -135,6 +145,7 @@ function installProvider(pi: ExtensionAPI) {
 }
 export default function(pi: ExtensionAPI) {
   installProvider(pi);
+  process.env.FM_TEST_OWNER_PID = String(process.pid);
   pi.on("session_start", (_event, ctx) => {
     log({ event: "start", kind: ctx.agent.kind, depth: ctx.agent.depth, tools: toolNames(pi) });
   });
@@ -142,9 +153,6 @@ export default function(pi: ExtensionAPI) {
     log({ event: "prompt", kind: ctx.agent.kind, prompt: event.prompt, tools: toolNames(pi) });
   });
   pi.on("session_shutdown", (_event, ctx) => { log({ event: "shutdown", kind: ctx.agent.kind }); });
-  // The lab lock belongs to this process before either primary session_start.
-  // No Firstmate production startup or fleet command runs in this fixture.
-  if (!existsSync(`${home}/state/.lock`)) writeFileSync(`${home}/state/.lock`, `${process.pid}\n`);
 }
 TS
 dump_live() {
@@ -162,8 +170,8 @@ if ! env -u FM_STATE_OVERRIDE -u FM_CONFIG_OVERRIDE -u FM_DATA_OVERRIDE \
   omp --cwd "$LAB" --no-session --no-extensions --no-skills --no-rules --no-title --no-lsp \
     --session-dir "$LAB/sessions" --auto-approve --mode json \
     --model fm-local/deterministic --thinking off \
-    -e "$LAB/.omp/extensions/fm-primary-omp-watch.ts" \
     -e "$LAB/.omp/extensions/fm-primary-turnend-guard.ts" \
+    -e "$LAB/.omp/extensions/fm-primary-omp-watch.ts" \
     -e "$LAB/.omp/extensions/z-live-probe.ts" \
     -p 'LIVE_PARENT_TASK' > "$LAB/output" 2> "$LAB/stderr"; then
   dump_live
@@ -174,6 +182,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 const home = process.argv[2];
 const rows = readFileSync(`${home}/events.jsonl`, "utf8").trim().split("\n").map(JSON.parse);
+assert(rows.filter(r => r.event === "start").every(r => !r.tools.includes("fm_watch_arm_omp")), "unowned startup must not expose the arm tool");
 assert(!rows.some(r => r.event === "failure"), JSON.stringify(rows.filter(r => r.event === "failure")));
 const prompts = rows.filter(r => r.event === "prompt");
 assert(prompts.some(r => r.kind === "main" && r.tools.includes("fm_watch_arm_omp")), "primary must see the arm tool");
@@ -181,6 +190,9 @@ assert(prompts.some(r => r.kind === "sub"), "real task child must have started")
 assert(prompts.filter(r => r.kind === "sub").every(r => !r.tools.includes("fm_watch_arm_omp")), "child received the arm tool");
 assert(rows.some(r => r.event === "shutdown" && r.kind === "sub"), "child must be disposed before wake");
 const calls = rows.filter(r => r.event === "provider");
+assert(calls.filter(r => !r.child).every(r => JSON.stringify(r.messages).includes("xd://fm_watch_arm_omp")), "owner provider must receive the arm device");
+assert(calls.filter(r => r.child).every(r => !JSON.stringify(r.messages).includes("xd://fm_watch_arm_omp")), "child provider received the arm device");
+assert(calls.some(r => !r.child && r.messages.some(m => m.role === "toolResult" && m.toolCallId === "owner-arm" && !m.isError && JSON.stringify(m.content).includes("watcher: unchanged"))), "owner arm device must execute successfully");
 assert(calls.some(r => !r.child && JSON.stringify(r.messages).includes("LIVE_PRIMARY_DIGEST")));
 assert(calls.some(r => !r.child && JSON.stringify(r.messages).includes("signal: LIVE_PRIMARY_WAKE")));
 assert(calls.filter(r => r.child).every(r => !JSON.stringify(r.messages).includes("FIRSTMATE_OP:")), "child received supervision context");

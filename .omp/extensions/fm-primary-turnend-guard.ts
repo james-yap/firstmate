@@ -28,7 +28,7 @@
 // for the Run tier.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 // Shared with the Pi extensions; the owner resolves bin/fm-operational-input.sh
@@ -44,6 +44,7 @@ import {
 type ExtensionAPI = {
   on?: (event: string, handler: (event: any, ctx: any) => unknown) => void;
   sendMessage?: (message: unknown) => void;
+  events?: { emit: (event: string, ctx: unknown) => void };
 };
 
 type LockOwnership = "owned" | "missing" | "other";
@@ -89,7 +90,8 @@ function lockOwnership(): LockOwnership {
 }
 
 function markLoaded(): void {
-  if (!existsSync(state) || lockOwnership() === "other") return;
+  if (lockOwnership() === "other") return;
+  mkdirSync(state, { recursive: true });
   writeFileSync(marker, `${extensionVersion}\n${process.pid}\n`);
 }
 
@@ -536,6 +538,12 @@ export default function (pi: ExtensionAPI) {
     sessionstartExitListenerRegistered = false;
   };
 
+  async function publishSessionstartCompletion(generation: SessionstartGeneration, ctx: SessionStartContext): Promise<void> {
+    await generation.result;
+    if (!sessionstartGenerationIsLive(generation)) return;
+    pi.events?.emit("firstmate:omp-sessionstart-complete", ctx);
+  }
+
   pi.on?.("session_start", (_event, ctx) => {
     if (ctx?.agent?.kind !== "main") return;
     sessionStarts += 1;
@@ -545,6 +553,7 @@ export default function (pi: ExtensionAPI) {
     markLoaded();
     registerSessionstartExitListener();
     sessionstartGeneration = createSessionstartGeneration(source, sessionIdFromContext(ctx));
+    void publishSessionstartCompletion(sessionstartGeneration, ctx);
   });
 
   pi.on?.("before_agent_start", async (_event, ctx) => {
@@ -563,6 +572,7 @@ export default function (pi: ExtensionAPI) {
     registerSessionstartExitListener();
     const generation = createSessionstartGeneration("compact", sessionIdFromContext(ctx));
     sessionstartGeneration = generation;
+    await publishSessionstartCompletion(generation, ctx);
     const message = await claimSessionstartMessage(generation, ctx);
     if (!message || !sessionstartGenerationIsLive(generation)) return;
     try {

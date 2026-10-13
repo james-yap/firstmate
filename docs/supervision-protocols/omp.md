@@ -6,8 +6,8 @@ When this primary session owns supervision and away mode is not active:
    After handling all emitted wakes and reconciling open decisions and unread status lines, run the exact `--ack-through` command printed as `WAKE_ACK_REQUIRED`; until then the work remains durable for idempotent re-handling after interruption.
 2. Confirm the omp primary auto-loaded both project extensions from `.omp/extensions/`; omp has no project-trust gate, so a plain `omp` started with this home as its working directory loads them with no dialog.
    If `bin/fm-session-start.sh` reported the omp extensions as not loaded, restart omp inside this home; pass `-e __FM_OMP_TURNEND_EXT__ -e __FM_OMP_EXT__` only when omp must start from another directory, because omp loads a file named both ways twice.
-3. Initial process cycle only: make the one required `fm_watch_arm_omp` call; if startup already owned the fleet lock, this is an ownership-based no-op.
-   Use `/fm-watch-arm-omp` only as a human-entered fallback.
+3. Native startup acquires the fleet lock before the extension exposes `fm_watch_arm_omp` and `/fm-watch-arm-omp`; a primary refused by another live owner receives neither control.
+   The extension arms the initial cycle automatically after native startup completes, or immediately at session open when the lock is already owned. Use `fm_watch_arm_omp` for the repairs described below and `/fm-watch-arm-omp` only as a human-entered fallback.
    Never run `bin/fm-watch-arm.sh` through omp's bash tool because that foreground arm can wedge the agent and bypasses extension-owned cleanup.
 4. If the extension says no live session holds the lock, run `bin/fm-session-start.sh` to reclaim the session lock, then call `fm_watch_arm_omp` again.
 5. The extension starts `bin/fm-watch-arm.sh --restart`, keeps the child attached to the live omp process, and owns every later successor launch.
@@ -29,3 +29,4 @@ The Pi supervision branch (`docs/pi-supervision-branch.md`) is Pi's in-process c
 The turn-end guard extension lives at `__FM_OMP_TURNEND_EXT__`.
 The watcher extension lives at `__FM_OMP_EXT__`.
 Both are tracked, project-local `.omp/extensions/*.ts` files that omp auto-discovers from this home with no trust dialog; `bin/fm-session-start.sh` reports when the running omp session has not loaded both required extensions.
+Each primary extension publishes its own loaded marker and creates the state directory if needed, so fresh-home detection does not depend on their loading order. Subagent factories publish neither marker.
