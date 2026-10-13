@@ -76,8 +76,9 @@
 // replayable record is the latest watermark. A wake is judged the same way just
 // before any send and when a replacement replays it. Unjudged and always
 // delivered: a check line outside the row-backed shapes, supervision-host lines,
-// a failure appendix, a record without a watermark, and any queue the extension
-// cannot read. A wake handed
+// a failure appendix, a record without a watermark, and a queue that fails to
+// read or parse. A queue file that was never created holds no rows, so only
+// then is there nothing to deliver. A wake handed
 // to omp ages out of the queue at the next final agent_end (runEpoch), because
 // omp either consumed it or never will. A run flag or queued wake outliving a
 // missed agent_end is cleared by the hold timer after three consecutive
@@ -419,8 +420,9 @@ function currentQueueSeq(): number | undefined {
 // queued row at or below the close's watermark remains. Rows past the watermark
 // belong to a later close, which carries its own wake, and the recovery marker
 // is deliberately not consulted because it is one slot every later append
-// reopens. Any doubt (unreadable or malformed queue, a record without a
-// watermark) answers false, so an unhandled event is always delivered.
+// reopens. A queue file that was never created holds no rows, so it answers
+// true; any other doubt (a queue that fails to read or parse, a record without
+// a watermark) answers false, so an unhandled event is always delivered.
 function wakeAlreadyHandled(pending: PendingActionableClose): boolean {
   if (pending.queueSeq === undefined || !rowBackedMessage(pending.message)) return false;
   let queue = "";

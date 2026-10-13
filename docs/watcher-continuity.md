@@ -82,7 +82,8 @@ The extension holds a signal, stale, heartbeat, or producer-proven row-backed ch
 Each such wake carries the queue's highest sequence at the moment its close was observed, and it is retired without a turn once no queued row at or below that sequence remains.
 Wakes still owed are delivered together as one follow-up.
 Delivered immediately and unjudged: any other check line (a merged outcome, rearm-resurface, inactive-outcome, contribution output, or process-event surface), a supervision-host handback, and a wake carrying a continuity-failure appendix.
-A record without a watermark, an unreadable queue, or a presented-but-unacknowledged row also delivers, so an unhandled event is never dropped.
+A record without a watermark, a queue that fails to read or parse, or a presented-but-unacknowledged row also delivers, so an unhandled event is never dropped.
+A queue file that was never created holds no rows, so only then is there nothing to deliver.
 The same judgment runs when a replacement session replays an unconsumed wake.
 The extension header owns how the run state is tracked and how a missed `agent_end` is recovered.
 
