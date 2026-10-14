@@ -1,0 +1,18 @@
+# config/approval-notify - opt-in notification when a decision is newly held for
+# the captain (bin/fm-captain-hold.sh hold). Copy this into a local, gitignored
+# config/approval-notify and edit. One directive per non-empty, non-comment line.
+# An absent or empty file sends nothing.
+#
+# Directives:
+#   off              position-independent kill switch
+#   command:<cmd>    run <cmd> via `sh -c`; the message is passed as $1 and on
+#                    stdin, so it can reach a phone or pager
+#
+# The message is "Approval needed: <task title> [<task id>]" plus a verified pull
+# request link when the task records one. The hold reason and backlog notes are
+# never sent. This only announces that a decision is waiting; answer it in
+# Firstmate as usual.
+#
+# Example: push to a phone through ntfy.sh. Replace the topic with your own
+# private topic, and treat anyone who knows it as able to read these messages.
+command: curl --fail --silent --show-error --max-time 8 -H "Title: Firstmate approval needed" --data-binary "$1" "https://ntfy.sh/replace-with-your-topic"
