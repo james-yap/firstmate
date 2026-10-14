@@ -79,10 +79,17 @@ fm_approval_notify_pr_link() {  # <state> <task-id> [<origin-id>]
 }
 
 _fm_approval_notify_digest() {  # <text>
+  local out
   if command -v shasum >/dev/null 2>&1; then
-    printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+    out=$(printf '%s' "$1" | shasum -a 256 | awk '{print $1}')
+    [ -n "$out" ] || return 1
+    printf '%s' "$out"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    out=$(printf '%s' "$1" | sha256sum | awk '{print $1}')
+    [ -n "$out" ] || return 1
+    printf '%s' "$out"
   else
-    printf '%s' "$1" | sha256sum | awk '{print $1}'
+    return 1
   fi
 }
 
@@ -122,7 +129,11 @@ fm_approval_notify() {  # <config-dir> <state> <task-id> <identity> <title> <lin
   marker="$dir/$id.sent"
   for cmd in "${commands[@]}"; do
     [ -n "$cmd" ] || { failed=1; printf 'actionable: approval notification for %s was not delivered: empty command: directive\n' "$id" >&2; continue; }
-    digest=$(_fm_approval_notify_digest "$cmd")
+    if ! digest=$(_fm_approval_notify_digest "$cmd"); then
+      failed=1
+      printf 'actionable: approval notification for %s was not delivered: could not fingerprint the channel; the captain call is still recorded, repeat the same hold to retry\n' "$id" >&2
+      continue
+    fi
     key="$identity $digest"
     if [ -f "$marker" ] && grep -qxF -- "$key" "$marker" 2>/dev/null; then
       continue
