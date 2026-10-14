@@ -1,0 +1,35 @@
+=== S1+S2: lifecycle home ===
+CHECK-OK: S1a unconfigured hold inert, no state dir
+CHECK-OK: S2a off kill-switch inert beside a command
+CHECK-OK: S2b date-deferred hold sends nothing
+--- sent.log after first hold ---
+Approval needed: Merge sample change [live-merge-call]
+https://github.com/james-yap/firstmate/pull/42
+--
+CHECK-OK: S1b title+id message delivered
+CHECK-OK: S1c verified PR link appended
+CHECK-OK: S1d message also on stdin
+CHECK-OK: S4a hold reason never leaks
+CHECK-OK: S1e exactly one delivery
+CHECK-OK: S2c repeated open call does not re-notify
+CHECK-OK: S2d answer sends nothing
+CHECK-OK: S1f re-hold after release is a new call and notifies again
+=== S3: failure / timeout / partial ===
+CHECK-OK: S3a failed channel keeps hold, exit 0, id printed
+CHECK-OK: S3b failure reported with status
+CHECK-OK: S4b command string not leaked
+CHECK-OK: S3c failed delivery not recorded
+CHECK-OK: S3d call still open after failure
+CHECK-OK: S3e hung channel bounded+reported (3s)
+CHECK-OK: S3f bad directive reported, not dropped
+CHECK-OK: S3g retry delivers exactly once, error clears
+=== S3h: partial retry only failed channel ===
+CHECK-OK: S3h-1 failed channel reported
+CHECK-OK: S3h-2 retry repeats only the failed channel
+=== S4c: verified-link gate ===
+CHECK-OK: S4c unverified link never sent
+CHECK-OK: S4d origin verified link sent
+=== example config shape (static, no network) ===
+CHECK-OK: S1g example shows ntfy command channel
+CHECK-OK: S1h example uses bounded curl with title header
+ALL-LIVE-SCENARIOS-DONE

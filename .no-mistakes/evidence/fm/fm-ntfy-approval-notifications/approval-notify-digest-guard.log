@@ -1,0 +1,16 @@
+shim tools:      968
+CHECK-OK: S5a shim hides shasum and sha256sum
+CHECK-OK: S5b digest returns 1 with no hash tools
+notify rc=1
+actionable: approval notification for live-digest-call was not delivered: could not fingerprint the channel; the captain call is still recorded, repeat the same hold to retry
+actionable: approval notification for live-digest-call was not delivered: could not fingerprint the channel; the captain call is still recorded, repeat the same hold to retry
+CHECK-OK: S5c digest failure is actionable (exit 1)
+fingerprint-error-lines=2
+CHECK-OK: S5d BOTH channels reported, no silent collapse into one empty key
+CHECK-OK: S5e nothing recorded as sent
+--- marker dir ---
+ls: /var/folders/zz/lc1pqgjj61q45dzwxvtv_qt40000gn/T//fm-digesthome.TpzDC5/state/approval-notify: No such file or directory
+(no marker dir, as expected)
+--- control: hash tools present still works ---
+CHECK-OK: S5f digest works when a hash tool exists (563f5b5387ca3d8d062c3ed67719c9896b73c811b02537d7d74889b311ffea2b)
+DIGEST-GUARD-DONE
