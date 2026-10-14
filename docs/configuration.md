@@ -552,27 +552,6 @@ An absent file means `auto`, i.e. default-on on macOS: the alarm exists precisel
 A missing or failing channel logs and falls through to the next, never crashing the daemon.
 See [`wedge-alarm.md`](wedge-alarm.md) for the current channel reference, [`verification/supervision.md`](verification/supervision.md#wedge-alarm-channels) for active evidence, and [`examples/wedge-alarm`](examples/wedge-alarm) for a copyable config.
 
-## Approval notifications (config/approval-notify)
-
-`bin/fm-captain-hold.sh hold` can announce a newly recorded captain call to a phone or pager.
-It is off unless `config/approval-notify` (local, gitignored, never inherited by secondmate homes) lists a directive, one per non-empty, non-comment line.
-Directives are `off` (a position-independent kill switch) and `command:<cmd>` (run `<cmd>` via `sh -c`, message on `$1` and stdin), the same command-channel pattern as `config/wedge-alarm`.
-This file is separate from `config/wedge-alarm`, whose stall-alarm meaning is unchanged.
-Copy [`examples/approval-notify`](examples/approval-notify), replace its placeholder topic, and treat anyone who knows an ntfy topic as able to read the messages.
-
-The notification fires after the call is durably held, for undated holds only, because a hold the captain deferred with `--until` is not asking for an answer now.
-It fires once per call: repeating `hold` on a still-open call, or answering it, sends nothing, while holding released work again is a new call and notifies again.
-Only calls held through `hold` notify, so a worker `needs-decision` that Firstmate answers itself never does.
-
-The message is `Approval needed: <task title> [<task id>]`, plus a pull request link when the held task's metadata, or its `--origin`'s, records one that `bin/fm-pr-lib.sh` accepts.
-The hold reason, backlog notes, command text, environment, and the command's own output are never included.
-The phone only announces the decision; the answer still goes to Firstmate.
-
-Each command is bounded by `FM_APPROVAL_NOTIFY_TIMEOUT_SECS` (default 10, invalid or zero uses the default).
-A failure or timeout prints `actionable: approval notification for <id> was not delivered` on stderr, keeps the call held, leaves the exit status 0, and is retried by repeating the same `hold`.
-A delivery is recorded under `state/approval-notify/<task-id>.sent` only after its command exits 0, so a retry repeats only the channel that failed.
-`bin/fm-approval-notify-lib.sh` owns the mechanics.
-
 ## Trace context propagation (config/trace-context / FM_TRACE_CONTEXT)
 
 The optional local, gitignored `config/trace-context` presence flag enables default-off native W3C trace-context propagation.

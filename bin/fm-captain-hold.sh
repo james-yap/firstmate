@@ -211,14 +211,6 @@
 # The hold or answer is already durable in the backlog, so a channel that
 # cannot be written is reported as `actionable:` on stderr rather than undoing
 # the record; bin/fm-inactive-reconcile.sh's diagnostics name a broken binding.
-#
-# Approval notification: after `hold` has durably recorded an undated call, it
-# runs the opt-in config/approval-notify command channel once per call, so a
-# phone or pager hears that a decision is waiting. bin/fm-approval-notify-lib.sh
-# owns the directives, message content, bound, once-per-call marker, and
-# failure reporting; a home with no such file sends nothing, and a delivery
-# failure is reported as `actionable:` on stderr while the hold stays recorded
-# and the exit status stays 0, so repeating the same `hold` retries delivery.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -245,9 +237,6 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 # shellcheck source=bin/fm-parent-channel-lib.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-parent-channel-lib.sh"
-# shellcheck source=bin/fm-approval-notify-lib.sh
-# shellcheck disable=SC1091
-. "$SCRIPT_DIR/fm-approval-notify-lib.sh"
 
 PARENT_HOLD_PUBLISHED=0
 publish_parent_hold() {  # <task-id> <occurrence> <verb> <note>
@@ -1019,15 +1008,6 @@ command_hold() {
   [ -n "$(body_hold_set_timestamp "$(show_field_value "$show" body)")" ] \
     || fail "task $id lost its hold-set stamp while being held"
   publish_parent_hold "$id" "$occurrence" needs-decision "$reason"
-  # A hold the captain deferred by date is not asking for an answer now, so only
-  # an undated hold notifies. A delivery problem is reported by the library and
-  # never undoes the recorded call.
-  if [ -z "$until" ]; then
-    fm_approval_notify "${FM_CONFIG_OVERRIDE:-$FM_HOME/config}" "$STATE" "$id" \
-      "$(body_hold_set_timestamp "$(show_field_value "$show" body)")#$((occurrence - 1))" \
-      "$(show_field_value "$show" title)" \
-      "$(fm_approval_notify_pr_link "$STATE" "$id" "$origin")" || true
-  fi
   printf '%s\n' "$id"
 }
 

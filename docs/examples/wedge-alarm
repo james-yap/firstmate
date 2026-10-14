@@ -11,12 +11,11 @@
 #   osascript        macOS Notification Center banner (backend-independent)
 #   herdr            herdr UI notification (herdr notification show)
 #   command:<cmd>    run <cmd> via `sh -c`; the alarm summary is passed as $1 and
-#                    on stdin, so it can reach a phone/pager while you are away
+#                    on stdin, so it can reach an external command while you are away
 #
 # An ABSENT config/wedge-alarm behaves as `auto` (default-on on macOS): the
 # alarm exists precisely so a wedged away-mode primary is never silent.
 #
-# Example: a macOS banner plus a push to a phone via ntfy.sh, so a wedge that
-# happens overnight reaches you even away from the machine.
+# Example: a macOS banner, so a wedge that happens overnight still surfaces
+# locally even away from the terminal.
 osascript
-command: curl -fsS -H "Title: firstmate wedge alarm" -d "$1" https://ntfy.sh/replace-with-your-topic

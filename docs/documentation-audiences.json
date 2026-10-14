@@ -337,10 +337,6 @@
       "audience": "maintainer-architecture"
     },
     {
-      "path": "docs/examples/approval-notify",
-      "audience": "operator-example"
-    },
-    {
       "path": "docs/examples/crew-dispatch.json",
       "audience": "operator-example"
     },

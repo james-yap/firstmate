@@ -16,7 +16,7 @@ It lists channel directives, one per non-empty, non-comment line, and every list
   Other platforms have no built-in OS channel, so configure `command:` when a durable marker alone is insufficient.
 - `osascript` posts a macOS Notification Center banner outside the terminal pane.
 - `herdr` calls `herdr notification show` outside the supervised pane.
-- `command:<cmd>` runs `<cmd>` through `sh -c` with the alarm summary as `$1` and on stdin, allowing delivery to a phone or pager service.
+- `command:<cmd>` runs `<cmd>` through `sh -c` with the alarm summary as `$1` and on stdin, allowing delivery to an external command.
 
 An absent `config/wedge-alarm` behaves as `auto`, which is default-on on macOS.
 This is deliberate because the alarm fires only after a genuine max-defer wedge and is rate-limited to at most once per max-defer window.
@@ -27,7 +27,6 @@ Every invocation is process-group bounded by `FM_WEDGE_ALARM_TIMEOUT_SECS`, whic
 On timeout or daemon shutdown, the notifier process group is terminated and the next configured channel may run.
 AppleScript receives the summary as an argv item rather than interpolated source, so summary text cannot alter the script.
 See [`examples/wedge-alarm`](examples/wedge-alarm) for a copyable config.
-This alarm covers stalled escalation delivery only; announcing an ordinary captain decision to a phone uses the separate `config/approval-notify` described in [`configuration.md`](configuration.md#approval-notifications-configapproval-notify).
 
 ## Test safety
 

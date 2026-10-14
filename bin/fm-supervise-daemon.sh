@@ -1049,7 +1049,7 @@ wedge_alarm_via_herdr() {  # <summary>
 }
 
 # Run a captain-supplied command with the summary on $1 and on stdin, so an
-# alert can reach a phone/pager (ntfy, Slack, SMS) even when the captain is away
+# alert can reach an external command even when the captain is away
 # from the machine entirely. Best-effort: logs and returns 1 on failure.
 wedge_alarm_via_command() {  # <cmd> <summary>
   local cmd=$1 summary=$2 rc
