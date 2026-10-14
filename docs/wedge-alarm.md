@@ -27,6 +27,7 @@ Every invocation is process-group bounded by `FM_WEDGE_ALARM_TIMEOUT_SECS`, whic
 On timeout or daemon shutdown, the notifier process group is terminated and the next configured channel may run.
 AppleScript receives the summary as an argv item rather than interpolated source, so summary text cannot alter the script.
 See [`examples/wedge-alarm`](examples/wedge-alarm) for a copyable config.
+This alarm covers stalled escalation delivery only; announcing an ordinary captain decision to a phone uses the separate `config/approval-notify` described in [`configuration.md`](configuration.md#approval-notifications-configapproval-notify).
 
 ## Test safety
 
